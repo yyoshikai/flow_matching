@@ -1,45 +1,26 @@
+import itertools as itr
 import multiprocessing
-from dataclasses import dataclass
-from typing import Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch import Tensor
 
 from rdkit import Chem
 from src.utils.logger import get_logger, add_file_handler
+from src.data.data import ExceptNoneDataset
 from src.data.datasets.unimol import UniMolLigandDataset
 from src.data.sampler import InfiniteRandomSampler
+from src.data.coord import get_random_rotation_matrix
 from src.fm.train import Vec, TSampler, train_fm
-from src.fm.utils import UniformTSampler, Streamers, SaveModelStreamer, LogStepStreamer, AmpRange, RepeatRange, StepStopCriterion
+from src.fm.utils import UniformTSampler, Streamers, SaveModelStreamer, LogStepStreamer, AmpRange, RepeatRange, StepStopCriterion, SaveDictLossStreamer
 from src.mol.model import MolData, MolVec, GraphFMModel, MolVecCriterion
 from src.mol.data import ATOMS
+from src.utils.random import set_random_seed
 
-def get_random_rotation_matrix(rng: np.random.Generator):
-    # get axes
-    axes = []
-    while(len(axes) < 2):
-        new_axis = rng.random(3)
-        
-        new_norm = np.sqrt(np.sum(new_axis**2))
-        if (new_norm < 0.1 or 1 <= new_norm): continue
-        new_axis = new_axis / new_norm
-        if np.any([np.abs(np.sum(axis*new_axis)) >= 0.9 for axis in axes]):
-            continue
-        axes.append(new_axis)
-
-    # get rotation matrix
-    axis0, axis1b = axes
-    axis1 = np.cross(axis0, axis1b)
-    axis1 = axis1 / np.linalg.norm(axis1)
-    axis2 = np.cross(axis0, axis1)
-    axis2 = axis2 / np.linalg.norm(axis2)
-    return np.array([axis0, axis1, axis2])
 
 class MolDater(Dataset[tuple[MolData, float, Vec[MolData]]]):
     def __init__(self):
-        self.n_atom = 100
+        self.n_atom = 120
         self.init_coord_std = 100
         self.end_coord_std = 100
 
@@ -60,15 +41,15 @@ class MolDater(Dataset[tuple[MolData, float, Vec[MolData]]]):
         coord = coord - np.mean(coord, axis=0)
         coord = np.matmul(coord, get_random_rotation_matrix(self.rng))
 
-        coord = np.concatenate([
+        coord = torch.tensor(np.concatenate([
             mol.GetConformer().GetPositions(),
             self.rng.normal(size=(n_no_atom, 3))*self.init_coord_std
-        ])
+        ]), dtype=torch.float32)
         return MolData(node, coord)
 
     def sample_init_data(self):
         node = torch.full((self.n_atom,), fill_value=self.mask_atom_idx, dtype=torch.long)
-        coord = self.rng.normal(size=(self.n_atom, 3)) * self.init_coord_std
+        coord = torch.tensor(self.rng.normal(size=(self.n_atom, 3)) * self.init_coord_std, dtype=torch.float32)
         return MolData(node, coord)
 
     def interleave(self, data0: MolData, data1: MolData, t) -> tuple[MolData, MolVec]:
@@ -108,43 +89,35 @@ class MolFMDataset(Dataset):
         data, vec = self.dater.interleave(data0, data1, t)
         return data, t, vec
 
-class ExceptNoneDataset[T](Dataset[T]):
-    logger = getLogger(f"{__module__}.{__qualname__}")
+if __name__ == '__main__':
 
-    def __init__(self, dataset: Dataset[T]):
-        self.dataset = dataset
-    def __len__(self):
-        return len(self.dataset)
-    def __getitem__(self, idx: int):
-        if idx < 0 or len(self) <= idx:
-            raise IndexError
-        try:
-            return self.dataset[idx]
-        except Exception as e:
-            
+    logger = get_logger(stream=True)
+    add_file_handler(logger, "train_mol/results/test/debug.log")
+    multiprocessing.set_start_method('fork')
+    set_random_seed(0)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.debug(f"{device=}")
 
-logger = get_logger(stream=True)
-add_file_handler(logger, "train_mol/results/test/debug.log")
-multiprocessing.set_start_method('fork')
+    dater = MolDater()
+    t_sampler = UniformTSampler(n_t_step=100)
+    data = UniMolLigandDataset('train', 'rdkit')
+    data = MolFMDataset(data, dater, t_sampler)
+    data = ExceptNoneDataset(data)
+    idx_sampler = InfiniteRandomSampler(data)
+    item_loader = DataLoader(data, batch_size=None, sampler=idx_sampler, num_workers=16)
+    item_iter = itr.filterfalse(lambda x: x is None, iter(item_loader))
+    batch_iter = itr.batched(item_iter, 128)
 
-dater = MolDater()
-t_sampler = UniformTSampler(n_t_step=100)
-data = UniMolLigandDataset('train', 'rdkit')
-data = MolFMDataset(data, dater, t_sampler)
-idx_sampler = InfiniteRandomSampler(data)
-loader = DataLoader(data, batch_size=128, sampler=idx_sampler, num_workers=16, collate_fn=lambda x: x)
-data_iter = iter(loader)
+    model = GraphFMModel(dater.n_idx)
+    model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-4)
+    criterion = MolVecCriterion(coord_weight=3/dater.n_idx)
+    streamer = Streamers([
+        LogStepStreamer(logger, AmpRange(10, 10000)), 
+        SaveModelStreamer("train_mol/results/test/models/{step}", RepeatRange(10000)), 
+        SaveDictLossStreamer("train_mol/results/test/loss.csv")
+    ])
+    stop_criterion = StepStopCriterion(10000)
 
-model = GraphFMModel(dater.n_idx)
-optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-4)
-criterion = MolVecCriterion()
-streamer = Streamers([
-    LogStepStreamer(logger, AmpRange(10, 10000)), 
-    SaveModelStreamer("train_mol/results/test/models/{step}", RepeatRange(10000))
-])
-stop_criterion = StepStopCriterion(10000)
-
-train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
-
-
+    train_fm(model, optimizer, batch_iter, criterion, streamer, stop_criterion)
 

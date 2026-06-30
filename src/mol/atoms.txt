@@ -4,9 +4,11 @@ C
 N
 O
 F
+Na
 Si
 P
 S
 Cl
+Se
 Br
 I

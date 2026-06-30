@@ -7,16 +7,27 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ..fm.train import Data, Vec, VecList, FMModel, Criterion
+from ..fm.utils import DictLoss
 
 @dataclass
 class MolData(Data):
     node: Tensor # long[Na,]
     coord: Tensor # [Na, 3]
+    def __post_init__(self):
+        assert isinstance(self.node, Tensor)
+        assert isinstance(self.coord, Tensor)
+        Na, = self.node.shape
+        assert self.coord.shape == (Na, 3)
 
 @dataclass
 class MolVec(Vec[MolData]):
     node: Tensor # [Na, T]
     coord: Tensor # [Na, 3]
+    def __post_init__(self):
+        assert isinstance(self.node, Tensor)
+        assert isinstance(self.coord, Tensor)
+        Na, T = self.node.shape
+        assert self.coord.shape == (Na, 3)
 
 @dataclass
 class MolVecList(VecList[MolVec]):
@@ -45,6 +56,7 @@ def get_dist(coord: Tensor):
 class GaussianPairEmbedding(nn.Module):
     def __init__(self, d_pair: int, n_node_type: int):
         super().__init__()
+        self.n_node_type = n_node_type
         self.pair_gweight_emb = nn.Embedding(n_node_type**2, d_pair)
         self.pair_gbias_emb = nn.Embedding(n_node_type**2, d_pair)
         self.pair_gmean = nn.Parameter(torch.zeros((d_pair,), dtype=torch.float))
@@ -63,9 +75,9 @@ class GaussianPairEmbedding(nn.Module):
         coord: (float)[B, Na, 3]
         """
 
-        B, Na, T = nodes.shape
+        B, Na = nodes.shape
         
-        pair_type = (nodes.reshape(B, Na, 1)*nodes.reshape(B, 1, Na)).reshape(B, Na, Na)
+        pair_type = (nodes.reshape(B, Na, 1)*self.n_node_type+nodes.reshape(B, 1, Na)).reshape(B, Na, Na)
         pair_gweight = self.pair_gweight_emb(pair_type) # [B, Na, Na, Dpair]
         pair_gbias = self.pair_gbias_emb(pair_type) # [B, Na, Na, Dpair]
         pair_dist = get_dist(coord) # [B, Na, Na]
@@ -99,6 +111,7 @@ class GraphAttnLayer(nn.Module):
             nn.Dropout(dropout), 
         )
         self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        self.out_dropout = nn.Dropout(dropout)
 
     def forward(self, x, edge):
         """
@@ -145,7 +158,7 @@ class GraphAttnLayer(nn.Module):
         attn_output = self.out_proj(attn_output)
         
         x = attn_output
-        x = x_res+self.dropout1(x)
+        x = x_res+self.out_dropout(x)
         edge = t + edge
 
         # feed-forward
@@ -153,19 +166,21 @@ class GraphAttnLayer(nn.Module):
 
         return x, edge
 
+nn.TransformerEncoderLayer
+
 class GraphFMModel(FMModel[MolData]):
     def __init__(self, n_node_type: int):
         super().__init__()
         d_model = 512
-        nhead = 64
         num_layers = 8
 
-        self.Dh = d_model // nhead
-        self.node_emb = nn.Linear(n_node_type, d_model)
-        self.pair_emb = GaussianPairEmbedding(self.Dh, n_node_type)
+        self.H = 64
+        self.Dh = d_model // self.H
+        self.node_emb = nn.Embedding(n_node_type, d_model)
+        self.pair_emb = GaussianPairEmbedding(self.H, n_node_type)
 
         self.layers = nn.ModuleList(
-            GraphAttnLayer(d_model, nhead) for _ in range(num_layers)
+            GraphAttnLayer(d_model, self.H) for _ in range(num_layers)
         )
         self.node_vec_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -173,9 +188,9 @@ class GraphFMModel(FMModel[MolData]):
             nn.Linear(d_model, n_node_type)
         )
         self.d_coord_proj = nn.Sequential(
-            nn.Linear(self.Dh, self.Dh), 
+            nn.Linear(self.H, self.H), 
             nn.GELU(), 
-            nn.Linear(self.Dh, 1)
+            nn.Linear(self.H, 1)
         )
 
 
@@ -189,11 +204,14 @@ class GraphFMModel(FMModel[MolData]):
         # attention layers
         x_node = self.node_emb(nodes) # [B, Na, D]
         x_pair_0 = self.pair_emb(nodes, coord) # [B, Na(Q), Na(K), Dh]
-        x_pair_shaped = x_pair_0.permute(0, 3, 1, 2).reshape(B*self.Dh, Na, Na) # [B*Dh, Q, K]
-        for layer in self.layers:
-            x_node, x_pair_shaped = layer(x_node, x_pair_shaped)
-        x_pair_final = x_pair_shaped.reshape(B, self.Dh, Na, Na).permute(0, 2, 3, 1)
-        
+        x_node_shaped = x_node.permute(1, 0, 2)
+        x_pair_shaped = x_pair_0.permute(0, 3, 1, 2).reshape(B*self.H, Na, Na) # [B*Dh, Q, K]
+        for i, layer in enumerate(self.layers):
+            print(f"{i=} node={torch.sum(torch.isnan(x_node_shaped)).item()}, pair={torch.sum(torch.isnan(x_pair_shaped)).item()}")
+            x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
+        x_pair_final = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
+        x_node = x_node_shaped.permute(1, 0, 2)
+
         # node vector
         node_vecs = self.node_vec_proj(x_node) # [B, Na, Nt]
 
@@ -208,15 +226,15 @@ class GraphFMModel(FMModel[MolData]):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-class MolVecCriterion(Criterion[MolData]):
+class MolVecCriterion(Criterion[MolData, DictLoss]):
+    def __init__(self, coord_weight: float):
+        self.weights = {'node': 1, 'coord': coord_weight}
+
     def __call__(self, vecs_true: list[MolVec], vecs_pred: MolVecList):
         node_vecs_true = torch.stack([vec.node for vec in vecs_true]).to(vecs_pred.nodes.device)
         coord_vecs_true = torch.stack([vec.coord for vec in vecs_true]).to(vecs_pred.coords.device)
-        return (node_vecs_true - vecs_pred.nodes)**2 \
-                + (coord_vecs_true - vecs_pred.coords)**2
 
-
-
-
-
-
+        return DictLoss({
+            'node': torch.mean((node_vecs_true - vecs_pred.nodes)**2), 
+            'coord': torch.mean((coord_vecs_true - vecs_pred.coords)**2)
+        }, self.weights)

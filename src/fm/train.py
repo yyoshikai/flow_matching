@@ -31,18 +31,22 @@ class PSampler[DataT]:
         raise NotImplementedError
     def sample_from_0(self) -> DataT:
         raise NotImplementedError
+    
+class Loss:
+    def backward(self):
+        raise NotImplementedError
+
+class Criterion[DataT, LossT](nn.Module):
+    def forward(self, vecs_true: list[Vec[DataT]], vecs_pred: VecList[Vec[DataT]]) -> LossT:
+        raise NotImplementedError
 
 class Streamer:
-    def put(self, model: nn.Module, batch_data: list[Data]) -> None:
+    def put(self, model: nn.Module, batch_data: list[Data], loss: Tensor|Loss) -> None:
         raise NotImplementedError
 
 class StopCriterion:
-    def __call__(self, model: nn.Module, batch_data: list[Data]) -> bool:
+    def __call__(self, model: nn.Module, batch_data: list[Data], loss: Tensor|Loss) -> bool:
         raise NotImplemented
-    
-class Criterion[DataT](nn.Module):
-    def forward(self, vecs_true: list[Vec[DataT]], vecs_pred: VecList[Vec[DataT]]) -> Tensor:
-        raise NotImplementedError
 
 class TrainFMDataset[DataT](Dataset[tuple[DataT, float, Vec[DataT]]]):
     def __init__(self, dataset: Dataset[DataT], t_sampler: TSampler, p_sampler: PSampler[DataT]):
@@ -72,8 +76,8 @@ def train_fm[DataT](
         loss = criterion(vecs, vecs_out)
         loss.backward()
         optimizer.step()
-        streamer.put(fm_model, batch_data)
-        if stop_criterion(fm_model, batch_data):
+        streamer.put(fm_model, batch_data, loss)
+        if stop_criterion(fm_model, batch_data, loss):
             break
 
 
