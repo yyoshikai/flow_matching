@@ -41,8 +41,12 @@ class Criterion[DataT, LossT](nn.Module):
         raise NotImplementedError
 
 class Streamer:
-    def put(self, model: nn.Module, batch_data: list[Data], loss: Tensor|Loss) -> None:
-        raise NotImplementedError
+    def put_data(self, batch: list[Data]):
+        pass
+    def put_loss(self, model: nn.Module, loss: Tensor|Loss) -> None:
+        pass
+    def put_optim(self, model: nn.Module):
+        pass
 
 class StopCriterion:
     def __call__(self, model: nn.Module, batch_data: list[Data], loss: Tensor|Loss) -> bool:
@@ -71,12 +75,14 @@ def train_fm[DataT](
     fm_model.train()
     while True:
         batch_data = data_iter.__next__()
+        streamer.put_data(batch_data)
         datas, ts, vecs = zip(*batch_data)
         vecs_out: VecList[DataT] = fm_model(datas, ts)
         loss = criterion(vecs, vecs_out)
+        streamer.put_loss(fm_model, loss)
         loss.backward()
         optimizer.step()
-        streamer.put(fm_model, batch_data, loss)
+        streamer.put_optim(fm_model)
         if stop_criterion(fm_model, batch_data, loss):
             break
 

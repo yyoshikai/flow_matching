@@ -1,4 +1,4 @@
-import os
+import os, random
 from logging import Logger
 from collections.abc import Container
 from typing import overload
@@ -9,12 +9,18 @@ from torch import Tensor
 from .train import TSampler, Loss, Streamer, StopCriterion
 
 # TSampler
-class UniformTSampler(TSampler):
+class DiscreteTSampler(TSampler):
     def __init__(self, n_t_step: int):
         self.n_t_step = n_t_step
     def __call__(self):
         return float(np.random.randint(0, self.n_t_step) / self.n_t_step)
-
+class UniformTSampler(TSampler):
+    def __init__(self):
+        pass
+    def __call__(self):
+        r = np.random.rand()
+        if r == 0: r = 1e-8
+        return r
 
 # Loss
 class DictLoss(Loss):
@@ -78,19 +84,25 @@ class AmpRange(Range):
 
 
 # Streamer
-class Streamers(Streamer):
+class Streamers(list[Streamer], Streamer):
     def __init__(self, streamers: list[Streamer]):
-        self.streamers = streamers
-    def put(self, model, batch_data, loss):
-        for streamer in self.streamers:
-            streamer.put(model, batch_data, loss)
+        super().__init__(streamers)
+    def put_data(self, batch):
+        for streamer in self:
+            streamer.put_data(batch)
+    def put_loss(self, model, loss):
+        for streamer in self:
+            streamer.put_loss(model, loss)
+    def put_optim(self, model):
+        for streamer in self:
+            streamer.put_optim(model)
 
 class SaveModelStreamer(Streamer):
     def __init__(self, path_format: str, range: Container):
         self.path_format = path_format
         self.range = range
         self.step = 0
-    def put(self, model, batch_data, loss):
+    def put_optim(self, model):
         self.step += 1
         if self.step in self.range:
             path = self.path_format.format(step=self.step)
@@ -102,17 +114,17 @@ class LogStepStreamer(Streamer):
         self.logger = logger
         self.range = range
         self.step = 0
-    def put(self, model, batch_data, loss):
+    def put_optim(self, model):
         self.step += 1
         if self.step in self.range:
             self.logger.debug(f"Finished step={self.step}")
 
-class SaveDictLossStreamer(Streamer):
+class SaveLossStreamer(Streamer):
     def __init__(self, path: str):
         self.path = path
         self.step = 0
         self.loss_keys = None
-    def put(self, model, batch_data, loss: DictLoss):
+    def put_loss(self, model, loss: DictLoss):
         if self.step == 0:
             self.loss_keys = list(loss.losses.keys())
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -123,6 +135,30 @@ class SaveDictLossStreamer(Streamer):
             row = [self.step]+[loss.losses[key].item() for key in self.loss_keys]
             f.write(','.join(map(str, row))+'\n')
         self.step += 1
+
+class SaveGradStreamer(Streamer):
+    def __init__(self, path_format: str, range: Container):
+        self.path_format = path_format
+        self.range = range
+        self.step = 0
+    def put_loss(self, model, loss: DictLoss):
+        self.step += 1
+        if self.step not in self.range:
+            return
+        names, params = zip(*[(name, p) for name, p in model.named_parameters() if p.requires_grad])
+        for k, l in loss.losses.items():
+            grads = torch.autograd.grad(
+                outputs=l, inputs=params, retain_graph=True, allow_unused=True
+            )
+            grad_state = {name: grad for name, grad in zip(names, grads)}
+            path = self.path_format.format(step=str(self.step), k=k)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            torch.save(grad_state, path)
+        
+        # model weight
+        path = self.path_format.format(step=str(self.step), k='weight')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(model.state_dict(), path)
 
 
 # StopCriterion

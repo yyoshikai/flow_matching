@@ -51,21 +51,29 @@ def get_dist(coord: Tensor):
     r2 = torch.sum(coord**2, dim=-1) # [*, Na]
     corr = torch.matmul(coord, coord.transpose(-1, -2)) # [*, Na, Na]
     dist2 = r2.unsqueeze(-1) + r2.unsqueeze(-2) - corr*2
-    return torch.sqrt(dist2)
+    return torch.sqrt(torch.abs(dist2))
 
 class GaussianPairEmbedding(nn.Module):
     def __init__(self, d_pair: int, n_node_type: int):
         super().__init__()
+        emb_size = 128
+
         self.n_node_type = n_node_type
-        self.pair_gweight_emb = nn.Embedding(n_node_type**2, d_pair)
-        self.pair_gbias_emb = nn.Embedding(n_node_type**2, d_pair)
-        self.pair_gmean = nn.Parameter(torch.zeros((d_pair,), dtype=torch.float))
-        self.pair_gstd = nn.Parameter(torch.ones((d_pair,), dtype=torch.float))
+        self.weight_emb = nn.Embedding(n_node_type**2, emb_size)
+        self.bias_emb = nn.Embedding(n_node_type**2, emb_size)
+        self.means = nn.Parameter(torch.zeros((emb_size,), dtype=torch.float))
+        self.stds = nn.Parameter(torch.ones((emb_size,), dtype=torch.float))
+        self.linear = nn.Linear(emb_size, d_pair)
         # Initialization from Uni-Mol
-        nn.init.uniform_(self.pair_gmean, 0, 3)
-        nn.init.uniform_(self.pair_gstd, 0, 3)
-        nn.init.constant_(self.pair_gweight_emb.weight, 1)
-        nn.init.constant_(self.pair_gbias_emb.weight, 0)
+        # nn.init.uniform_(self.means, 0, 3)
+        # nn.init.uniform_(self.stds, 0, 3)
+        # nn.init.constant_(self.weight_emb.weight, 1)
+        # nn.init.constant_(self.bias_emb.weight, 0)
+
+        # Initialization in 3dVAE
+        nn.init.normal_(self.weight_emb.weight, 0.0, 1.0)
+        nn.init.normal_(self.bias_emb.weight, 0.0, 1.0)
+
 
     def forward(self, nodes: Tensor, coord: Tensor) -> Tensor:
         """
@@ -78,14 +86,15 @@ class GaussianPairEmbedding(nn.Module):
         B, Na = nodes.shape
         
         pair_type = (nodes.reshape(B, Na, 1)*self.n_node_type+nodes.reshape(B, 1, Na)).reshape(B, Na, Na)
-        pair_gweight = self.pair_gweight_emb(pair_type) # [B, Na, Na, Dpair]
-        pair_gbias = self.pair_gbias_emb(pair_type) # [B, Na, Na, Dpair]
-        pair_dist = get_dist(coord) # [B, Na, Na]
-        pair_g = pair_dist.unsqueeze(-1) * pair_gweight + pair_gbias
-        pair_gstd = self.pair_gstd.abs() + 1e-5
-        pair_dist_emb = torch.exp(-0.5*((pair_g-self.pair_gmean)/pair_gstd)**2) \
-                / ((2*torch.pi)**0.5*pair_gstd)
-        return pair_dist_emb
+        dist_weight = self.weight_emb(pair_type) # [B, Na, Na, Dpair]
+        dist_bias = self.bias_emb(pair_type) # [B, Na, Na, Dpair]
+        dist = get_dist(coord) # [B, Na, Na]
+        pair_g = dist.unsqueeze(-1) * dist_weight + dist_bias
+        stds = self.stds.abs() + 1e-5
+        pair_dist_emb = torch.exp(-0.5*(((pair_g-self.means)/stds)**2)) \
+                / ((2*torch.pi)**0.5*stds)
+        pair_emb = self.linear(pair_dist_emb)
+        return pair_emb
 
 class GraphAttnLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff_factor=4, dropout=0.0):
@@ -166,8 +175,6 @@ class GraphAttnLayer(nn.Module):
 
         return x, edge
 
-nn.TransformerEncoderLayer
-
 class GraphFMModel(FMModel[MolData]):
     def __init__(self, n_node_type: int):
         super().__init__()
@@ -207,7 +214,6 @@ class GraphFMModel(FMModel[MolData]):
         x_node_shaped = x_node.permute(1, 0, 2)
         x_pair_shaped = x_pair_0.permute(0, 3, 1, 2).reshape(B*self.H, Na, Na) # [B*Dh, Q, K]
         for i, layer in enumerate(self.layers):
-            print(f"{i=} node={torch.sum(torch.isnan(x_node_shaped)).item()}, pair={torch.sum(torch.isnan(x_pair_shaped)).item()}")
             x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
         x_pair_final = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
         x_node = x_node_shaped.permute(1, 0, 2)
