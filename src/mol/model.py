@@ -175,7 +175,7 @@ class GraphAttnLayer(nn.Module):
 
         return x, edge
 
-class GraphFMModel(FMModel[MolData]):
+class MolModel(FMModel[MolData]):
     def __init__(self, n_node_type: int):
         super().__init__()
         d_model = 512
@@ -189,17 +189,6 @@ class GraphFMModel(FMModel[MolData]):
         self.layers = nn.ModuleList(
             GraphAttnLayer(d_model, self.H) for _ in range(num_layers)
         )
-        self.node_vec_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, n_node_type)
-        )
-        self.d_coord_proj = nn.Sequential(
-            nn.Linear(self.H, self.H), 
-            nn.GELU(), 
-            nn.Linear(self.H, 1)
-        )
-
 
     def forward(self, datas: list[MolData], ts: list[float]) -> list[MolVec]:
         device = self.device()
@@ -217,17 +206,8 @@ class GraphFMModel(FMModel[MolData]):
             x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
         x_pair_final = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
         x_node = x_node_shaped.permute(1, 0, 2)
-
-        # node vector
-        node_vecs = self.node_vec_proj(x_node) # [B, Na, Nt]
-
-        # coord vector        
         d_x_pair = x_pair_final - x_pair_0 # [B, Na, Na, Dh]
-        pair_coef = self.d_coord_proj(d_x_pair) # [B, Na, Na, 1]
-        coord_diff = coord.reshape(B, Na, 1, 3) - coord.reshape(B, 1, Na, 3) # [B, Na, Na, 3]
-        coord_vecs = torch.sum(coord_diff * pair_coef, dim=2) / Na # [B, Na, 3]
-
-        return MolVecList(node_vecs, coord_vecs)
+        return x_node, d_x_pair
 
     def device(self) -> torch.device:
         return next(self.parameters()).device
