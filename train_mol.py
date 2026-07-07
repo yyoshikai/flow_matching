@@ -27,7 +27,6 @@ from src.mol.data import ATOMS
 
 class Mol:
     pass
-
 class ExpMol(Mol):
     def __init__(self, mol: Chem.Mol, rng: np.random.Generator, no_coord_std: float):
         self.mol = mol
@@ -43,29 +42,33 @@ class MolEncoder:
     logger = getLogger(f"{__module__}.{__qualname__}")
     def __init__(self, n_atom: int):
         self.n_atom = n_atom
+        self.no_atom_idx = 0
+        self.atom2idx = {atom: i for i, atom in enumerate(['NO']+ATOMS+['MASK'])}
+        self.mask_atom_idx = len(ATOMS)+1
+        self.n_idx = len(ATOMS)+2
     
     def encode(self, mol: Mol) -> MolData:
         if isinstance(mol, ExpMol):
-            mol = mol.mol
-            n_mol_atom = mol.GetNumAtoms()
-            n_atom = min(self.n_atom, )
-            if n_mol_atom > n_atom:
-                logger.warning(f"{n_mol_atom=} > {n_atom=}")
-                n_mol_atom = n_atom
-            node = torch.tensor([self.atom2idx[atom.GetSymbol()] for atom in mol.GetAtoms()]+[self.no_atom_idx]*n_no_atom, dtype=torch.long)
+            rdmol = mol.mol
+            n_mol_atom = rdmol.GetNumAtoms()
+            if n_mol_atom > self.n_atom:
+                logger.warning(f"{n_mol_atom=} > {self.n_atom=}")
+                n_mol_atom = self.n_atom
+            n_no_atom = self.n_atom-n_mol_atom
+            node = torch.tensor([self.atom2idx[rdmol.GetAtomWithIdx(i)] for i in range(n_mol_atom)]+[self.no_atom_idx]*n_no_atom, dtype=torch.long)
             
-            coord = mol.GetConformer().GetPositions() # [Na, 3]
+            coord = rdmol.GetConformer().GetPositions() # [Na, 3]
             coord = coord - np.mean(coord, axis=0)
             coord = np.matmul(coord, get_random_rotation_matrix(self.rng))
 
             coord = torch.tensor(np.concatenate([
-                mol.GetConformer().GetPositions(),
-                self.rng.normal(size=(n_no_atom, 3))*self.init_coord_std
+                rdmol.GetConformer().GetPositions(),
+                mol.rng.normal(size=(n_no_atom, 3))*mol.no_coord_std
             ]), dtype=torch.float32)
             return MolData(node, coord)
         elif isinstance(mol, ImpMol):
             node = torch.full((self.n_atom,), fill_value=self.mask_atom_idx, dtype=torch.long)
-            coord = torch.tensor(self.rng.normal(size=(self.n_atom, 3)) * self.coord_std, dtype=torch.float32)
+            coord = torch.tensor(mol.rng.normal(size=(self.n_atom, 3)) * mol.coord_std, dtype=torch.float32)
             return MolData(node, coord)
         else:
             raise ValueError
@@ -80,18 +83,16 @@ class InitMolSampler:
         self.rng.random()
         return ImpMol(self.atom_state, deepcopy(self.rng), self.coord_std)
 
-class InitMolSampler:
-    def __init__(self, 
-            
-            coord_std: float, 
-            use_mask: bool=True, 
-            mask_atom_idx: int|None = None
-    ):
-        self.coord_std = coord_std
-        self.use_mask = use_mask
-        self.mask_atom_idx = mask_atom_idx
+class MolPSampler:
+    def __init__(self, a: float, b: float):
+        self.a = a
+        self.b = b
 
-    def sample(self):
+    def interleave(self, data0: MolData, data1: MolData, t) -> tuple[MolData, MolVec]:
+
+        k = t+self.a*t*(1-t)**2+self.b*(1-t)**2*t
+        # node
+        
 
 
 class MolDater(Dataset[tuple[MolData, float, Vec[MolData]]]):
@@ -106,22 +107,6 @@ class MolDater(Dataset[tuple[MolData, float, Vec[MolData]]]):
         self.n_idx = len(ATOMS)+2
         self.rng = np.random.default_rng(0)
         self.kappas = Kappas(alpha)
-
-    def to_data(self, mol: Chem.Mol):
-        n_no_atom = self.n_atom - mol.GetNumAtoms()
-        if n_no_atom < 0:
-            raise ValueError(f"{mol.GetNumAtoms()=}")
-        node = torch.tensor([self.atom2idx[atom.GetSymbol()] for atom in mol.GetAtoms()]+[self.no_atom_idx]*n_no_atom, dtype=torch.long)
-        
-        coord = mol.GetConformer().GetPositions() # [Na, 3]
-        coord = coord - np.mean(coord, axis=0)
-        coord = np.matmul(coord, get_random_rotation_matrix(self.rng))
-
-        coord = torch.tensor(np.concatenate([
-            mol.GetConformer().GetPositions(),
-            self.rng.normal(size=(n_no_atom, 3))*self.init_coord_std
-        ]), dtype=torch.float32)
-        return MolData(node, coord)
 
     def interleave(self, data0: MolData, data1: MolData, t) -> tuple[MolData, MolVec]:
         # node
