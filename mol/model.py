@@ -80,7 +80,7 @@ class TrigCoordEmbedding(nn.Module):
     def forward(self, coord: Tensor):
         B, Na, _ = coord.shape
         x_sin = torch.sin(coord.unsqueeze(-1)*self.coef) # [B, Na, 3, D/2]
-        x_cos = torch.sin(coord.unsqueeze(-1)*self.coef) # [B, Na, 3, D/2]
+        x_cos = torch.cos(coord.unsqueeze(-1)*self.coef) # [B, Na, 3, D/2]
         x = torch.cat([x_sin, x_cos], dim=-1).reshape(B, Na, 3*self.D)
         x = self.proj(x)
         return x

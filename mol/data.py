@@ -67,7 +67,7 @@ class MolEncoder:
             coord = np.matmul(coord, get_random_rotation_matrix(mol.rng))
 
             coord = torch.tensor(np.concatenate([
-                rdmol.GetConformer().GetPositions(),
+                coord,
                 mol.rng.normal(size=(n_no_atom, 3))*mol.no_coord_std
             ]), dtype=torch.float32)
             return MolData(node, coord)

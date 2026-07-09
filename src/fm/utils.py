@@ -151,6 +151,8 @@ class Optimizer:
         self.optimizer.step()
         if self.scheduler is not None:
             self.scheduler.step()
+    def zero_grad(self):
+        self.optimizer.zero_grad()
 
 
 # StopCriterion

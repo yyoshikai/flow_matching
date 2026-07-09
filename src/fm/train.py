@@ -63,6 +63,7 @@ def train_fm[D, Tgt, BPred](
         batch_data = data_iter.__next__()
         streamer.put_data(batch_data)
         datas, ts, targets = zip(*batch_data)
+        optimizer.zero_grad()
         bpred = fm_model(datas, ts)
         loss = path.criterion(targets, bpred)
         streamer.put_loss(fm_model, loss)

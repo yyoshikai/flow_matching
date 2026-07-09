@@ -108,7 +108,7 @@ class MolFMModel(FMModel[MolData, tuple[Tensor, Tensor]]):
         
         nodes = torch.stack([data.node for data in datas]).to(device) # [B, Na]
         coord = torch.stack([data.coord for data in datas]).to(device) # [B, Na, 3]
-        ts = torch.tensor(ts).to(device)
+        ts = torch.tensor(ts, dtype=torch.float32).to(device)
         B, Na = nodes.shape
 
         # Embedding
