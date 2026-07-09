@@ -1,74 +1,60 @@
-import torch.nn as nn
+import math
+import itertools as itr
+from dataclasses import dataclass
 from collections.abc import Iterator
-from typing import Self
+from typing import Self, Any
+import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
 
-class Data:
-    def update(self, vec: 'Vec[Self]', delta_t: float):
-        raise NotImplementedError
-
-class Vec[DataT]:
-    pass
-
-class VecList[VecT]:
-    def to_list(self) -> list[VecT]:
-        raise NotImplementedError
-
-class FMModel[DataT](nn.Module):
-    def forward(self, datas: list[DataT], ts: list[float]) -> VecList[Vec[DataT]]:
+class Path[D, Tgt, BPred]:
+    def sample(self, data0: D, data1: D, t: float) -> tuple[D, Tgt]:
         raise NotImplementedError
     
-class TSampler:
-    def __call__(self) -> float:
-        raise NotImplementedError
-    def iter_t_step(self) -> Iterator[float, float]:
+    def update(self, datas: list[D], bpred: BPred, t: float, delta_t: float) -> list[D]:
         raise NotImplementedError
 
-class PSampler[DataT]:
-    def sample(self, data1: DataT, t: float) -> tuple[DataT, Vec[DataT]]:
+    def criterion(self, targets: list[Tgt], bpred: BPred) -> Loss:
         raise NotImplementedError
-    def sample_from_0(self) -> DataT:
+
+class FMModel[D, BPred](nn.Module):
+    def forward(self, datas: list[D], ts: list[float]) -> BPred:
         raise NotImplementedError
-    
+
+@dataclass
 class Loss:
-    def backward(self):
-        raise NotImplementedError
+    losses: list[Tensor]
+    names: list[str]
+    weights: list[float]
 
-class Criterion[DataT, LossT](nn.Module):
-    def forward(self, vecs_true: list[Vec[DataT]], vecs_pred: VecList[Vec[DataT]]) -> LossT:
-        raise NotImplementedError
+    def loss(self):
+        return sum(loss*weight for loss, weight in zip(self.losses, self.weights))
+    
+    @classmethod
+    def cat(cls, *cinfos: Loss):
+        losses = list(itr.chain(*[cinfo.losses for cinfo in cinfos]))
+        names = list(itr.chain(*[cinfo.names for cinfo in cinfos]))
+        weights = list(itr.chain(*[cinfo.weights for cinfo in cinfos]))
+        return Loss(losses, names, weights)
 
-class Streamer:
-    def put_data(self, batch: list[Data]):
+class Streamer[D, Tgt]:
+    def put_data(self, batch: list[tuple[D, float, Tgt]]):
         pass
-    def put_loss(self, model: nn.Module, loss: Tensor|Loss) -> None:
+    def put_loss(self, model: nn.Module, loss: Loss) -> None:
         pass
-    def put_optim(self, model: nn.Module):
+    def put_optim(self, model: nn.Module, optimizer: Optimizer):
         pass
 
-class StopCriterion:
-    def __call__(self, model: nn.Module, batch_data: list[Data], loss: Tensor|Loss) -> bool:
+class StopCriterion[D]:
+    def __call__(self, model: nn.Module, batch_data: list[D], loss: Tensor) -> bool:
         raise NotImplemented
 
-class TrainFMDataset[DataT](Dataset[tuple[DataT, float, Vec[DataT]]]):
-    def __init__(self, dataset: Dataset[DataT], t_sampler: TSampler, p_sampler: PSampler[DataT]):
-        self.dataset = dataset
-        self.t_sampler = t_sampler
-        self.p_sampler = p_sampler
-    
-    def __getitem__(self, idx):
-        data1 = self.dataset[idx]
-        t = self.t_sampler.sample()
-        data, vec = self.p_sampler.sample(data1, t)
-        return data, t, vec
-
-def train_fm[DataT](
-    fm_model: FMModel[DataT], 
+def train_fm[D, Tgt, BPred](
+    fm_model: FMModel[D], 
     optimizer: Optimizer,
-    data_iter: Iterator[tuple[DataT, float, Vec[DataT]]],
-    criterion: Criterion[DataT],
+    data_iter: Iterator[tuple[D, float, Tgt]],
+    path: Path[D, Tgt, BPred],
     streamer: Streamer,
     stop_criterion: StopCriterion,
 ):
@@ -76,21 +62,19 @@ def train_fm[DataT](
     while True:
         batch_data = data_iter.__next__()
         streamer.put_data(batch_data)
-        datas, ts, vecs = zip(*batch_data)
-        vecs_out: VecList[DataT] = fm_model(datas, ts)
-        loss = criterion(vecs, vecs_out)
+        datas, ts, targets = zip(*batch_data)
+        bpred = fm_model(datas, ts)
+        loss = path.criterion(targets, bpred)
         streamer.put_loss(fm_model, loss)
-        loss.backward()
+        loss.loss().backward()
         optimizer.step()
-        streamer.put_optim(fm_model)
+        streamer.put_optim(fm_model, optimizer)
         if stop_criterion(fm_model, batch_data, loss):
             break
 
+class Distribution[D]:
+    def sample(self) -> D:
+        raise NotImplementedError
 
-
-
-
-
-
-
-
+    def bsample(self, n: int) -> list[D]:
+        return [self.sample() for i in range(n)]

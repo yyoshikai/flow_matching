@@ -1,4 +1,5 @@
 import os, random
+import itertools as itr
 from logging import Logger
 from collections.abc import Container
 from typing import overload
@@ -6,32 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import Tensor
-from .train import TSampler, Loss, Streamer, StopCriterion
-
-# TSampler
-class DiscreteTSampler(TSampler):
-    def __init__(self, n_t_step: int):
-        self.n_t_step = n_t_step
-    def __call__(self):
-        return float(np.random.randint(0, self.n_t_step) / self.n_t_step)
-class UniformTSampler(TSampler):
-    def __init__(self):
-        pass
-    def __call__(self):
-        r = np.random.rand()
-        if r == 0: r = 1e-8
-        return r
-
-# Loss
-class DictLoss(Loss):
-    def __init__(self, losses: dict[str, Tensor], weights: dict[str, Tensor]):
-        self.losses = losses
-        self.weights = weights
-        assert set(self.losses.keys()) == set(self.weights.keys())
-    def backward(self):
-        loss = sum(loss*self.weights[key] for key, loss in self.losses.items())
-        loss.backward()
-
+from torch.optim.lr_scheduler import LRScheduler
+from .train import Streamer, StopCriterion
 
 # Range
 class Range(Container):
@@ -93,16 +70,16 @@ class Streamers(list[Streamer], Streamer):
     def put_loss(self, model, loss):
         for streamer in self:
             streamer.put_loss(model, loss)
-    def put_optim(self, model):
+    def put_optim(self, model, optimizer):
         for streamer in self:
-            streamer.put_optim(model)
+            streamer.put_optim(model, optimizer)
 
 class SaveModelStreamer(Streamer):
     def __init__(self, path_format: str, range: Container):
         self.path_format = path_format
         self.range = range
         self.step = 0
-    def put_optim(self, model):
+    def put_optim(self, model, optimizer):
         self.step += 1
         if self.step in self.range:
             path = self.path_format.format(step=self.step)
@@ -114,7 +91,7 @@ class LogStepStreamer(Streamer):
         self.logger = logger
         self.range = range
         self.step = 0
-    def put_optim(self, model):
+    def put_optim(self, model, optimizer):
         self.step += 1
         if self.step in self.range:
             self.logger.debug(f"Finished step={self.step}")
@@ -123,16 +100,17 @@ class SaveLossStreamer(Streamer):
     def __init__(self, path: str):
         self.path = path
         self.step = 0
-        self.loss_keys = None
-    def put_loss(self, model, loss: DictLoss):
+        self.loss_names = None
+    def put_loss(self, model, loss):
         if self.step == 0:
-            self.loss_keys = list(loss.losses.keys())
+            self.loss_names = loss.names
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             with open(self.path, 'w') as f:
-                f.write(','.join(['step']+self.loss_keys)+'\n')
-        assert set(self.loss_keys) == set(loss.losses.keys())
+                f.write(','.join(['step']+self.loss_names)+'\n')
+        else:
+            assert self.loss_names == loss.names
         with open(self.path, 'a') as f:
-            row = [self.step]+[loss.losses[key].item() for key in self.loss_keys]
+            row = [self.step]+[l.item() for l in loss.losses]
             f.write(','.join(map(str, row))+'\n')
         self.step += 1
 
@@ -141,12 +119,12 @@ class SaveGradStreamer(Streamer):
         self.path_format = path_format
         self.range = range
         self.step = 0
-    def put_loss(self, model, loss: DictLoss):
+    def put_loss(self, model, loss):
         self.step += 1
         if self.step not in self.range:
             return
         names, params = zip(*[(name, p) for name, p in model.named_parameters() if p.requires_grad])
-        for k, l in loss.losses.items():
+        for k, l in zip(loss.names, loss.losses):
             grads = torch.autograd.grad(
                 outputs=l, inputs=params, retain_graph=True, allow_unused=True
             )
@@ -159,6 +137,20 @@ class SaveGradStreamer(Streamer):
         path = self.path_format.format(step=str(self.step), k='weight')
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(model.state_dict(), path)
+
+
+class Optimizer:
+    def __init__(self, optimizer: torch.optim.Optimizer, scheduler: LRScheduler|None, clip_grad_norm: float|None):
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.clip_grad_norm = clip_grad_norm
+    def step(self):
+        if self.clip_grad_norm is not None:
+            params = itr.chain(*[group['params'] for group in self.optimizer.param_groups])
+            nn.utils.clip_grad_norm_(params, self.clip_grad_norm)
+        self.optimizer.step()
+        if self.scheduler is not None:
+            self.scheduler.step()
 
 
 # StopCriterion

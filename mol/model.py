@@ -1,42 +1,8 @@
-import os, math
-from pathlib import Path
-from dataclasses import dataclass
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-
-from ..fm.train import Data, Vec, VecList, FMModel, Criterion
-from ..fm.utils import DictLoss
-
-@dataclass
-class MolData(Data):
-    node: Tensor # long[Na,]
-    coord: Tensor # [Na, 3]
-    def __post_init__(self):
-        assert isinstance(self.node, Tensor)
-        assert isinstance(self.coord, Tensor)
-        Na, = self.node.shape
-        assert self.coord.shape == (Na, 3)
-
-@dataclass
-class MolVec(Vec[MolData]):
-    node: Tensor # [Na, T]
-    coord: Tensor # [Na, 3]
-    def __post_init__(self):
-        assert isinstance(self.node, Tensor)
-        assert isinstance(self.coord, Tensor)
-        Na, T = self.node.shape
-        assert self.coord.shape == (Na, 3)
-
-@dataclass
-class MolVecList(VecList[MolVec]):
-    nodes: Tensor # [B, Na, T]
-    coords: Tensor # [B, Na, T]
-
-    def to_list(self):
-        B, *_ = self.nodes.shape
-        return [MolVec(self.nodes[i], self.coords[i]) for i in range(B)]
 
 def get_dist(coord: Tensor):
     """
@@ -95,6 +61,31 @@ class GaussianPairEmbedding(nn.Module):
                 / ((2*torch.pi)**0.5*stds)
         pair_emb = self.linear(pair_dist_emb)
         return pair_emb
+
+
+class TrigCoordEmbedding(nn.Module):
+    """
+    Embed coord directly with sinusoidal embedding
+    ( = remove 3d-equivariance)
+    
+    """
+    def __init__(self, D: int):
+        super().__init__()
+        assert D % 2 == 0
+        self.D = D
+        coef = torch.tensor([10/10000**(d*2/D) for d in range(D//2)])
+        self.register_buffer('coef', coef)
+        self.proj = nn.Linear(D*3, D)
+
+    def forward(self, coord: Tensor):
+        B, Na, _ = coord.shape
+        x_sin = torch.sin(coord.unsqueeze(-1)*self.coef) # [B, Na, 3, D/2]
+        x_cos = torch.sin(coord.unsqueeze(-1)*self.coef) # [B, Na, 3, D/2]
+        x = torch.cat([x_sin, x_cos], dim=-1).reshape(B, Na, 3*self.D)
+        x = self.proj(x)
+        return x
+
+
 
 class GraphAttnLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff_factor=4, dropout=0.0):
@@ -175,52 +166,58 @@ class GraphAttnLayer(nn.Module):
 
         return x, edge
 
-class MolModel(FMModel[MolData]):
-    def __init__(self, n_node_type: int):
+class GraphAttnModel(nn.Module):
+    def __init__(self):
         super().__init__()
-        d_model = 512
-        num_layers = 8
-
+        self.d_model = 512
+        self.num_layers = 8
         self.H = 64
-        self.Dh = d_model // self.H
-        self.node_emb = nn.Embedding(n_node_type, d_model)
-        self.pair_emb = GaussianPairEmbedding(self.H, n_node_type)
 
         self.layers = nn.ModuleList(
-            GraphAttnLayer(d_model, self.H) for _ in range(num_layers)
+            GraphAttnLayer(self.d_model, self.H) for _ in range(self.num_layers)
         )
 
-    def forward(self, datas: list[MolData], ts: list[float]) -> list[MolVec]:
-        device = self.device()
-        
-        nodes = torch.stack([data.node for data in datas]).to(device) # [B, Na]
-        coord = torch.stack([data.coord for data in datas]).to(device) # [B, Na, 3]
-        B, Na = nodes.shape
+    def forward(self, x_node: Tensor, x_pair: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Parameters
+        ----------
+        x_node: [B, Na, D]
+        x_pair: [B, Na, Na, Dh]
 
-        # attention layers
-        x_node = self.node_emb(nodes) # [B, Na, D]
-        x_pair_0 = self.pair_emb(nodes, coord) # [B, Na(Q), Na(K), Dh]
+        Returns
+        -------
+        x_node: [B, Na, D]
+        x_pair: [B, Na, Na, Dh]
+        
+        """
+        B, Na, _ = x_node.shape
+
         x_node_shaped = x_node.permute(1, 0, 2)
-        x_pair_shaped = x_pair_0.permute(0, 3, 1, 2).reshape(B*self.H, Na, Na) # [B*Dh, Q, K]
+        x_pair_shaped = x_pair.permute(0, 3, 1, 2).reshape(B*self.H, Na, Na) # [B*Dh, Q, K]
         for i, layer in enumerate(self.layers):
             x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
-        x_pair_final = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
+        x_pair = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
         x_node = x_node_shaped.permute(1, 0, 2)
-        d_x_pair = x_pair_final - x_pair_0 # [B, Na, Na, Dh]
-        return x_node, d_x_pair
+        return x_node, x_pair
 
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
 
-class MolVecCriterion(Criterion[MolData, DictLoss]):
-    def __init__(self, coord_weight: float):
-        self.weights = {'node': 1, 'coord': coord_weight}
-
-    def __call__(self, vecs_true: list[MolVec], vecs_pred: MolVecList):
-        node_vecs_true = torch.stack([vec.node for vec in vecs_true]).to(vecs_pred.nodes.device)
-        coord_vecs_true = torch.stack([vec.coord for vec in vecs_true]).to(vecs_pred.coords.device)
-
-        return DictLoss({
-            'node': torch.mean((node_vecs_true - vecs_pred.nodes)**2), 
-            'coord': torch.mean((coord_vecs_true - vecs_pred.coords)**2)
-        }, self.weights)
+class DiffCoordHead(nn.Module):
+    def __init__(self, D):
+        self.proj = nn.Sequential(
+            nn.Linear(D, D), 
+            nn.GELU(), 
+            nn.Linear(D, 1)
+        )
+    def forward(self, x: Tensor, coord: Tensor):
+        """
+        Parameters
+        ----------
+        x: Tensor(float) [B, Na, Na, D]
+        coord: Tensor(float) [B, Na, 3]
+        """
+        B, Na, _ = coord.shape
+        
+        pair_coef = self.proj(x) # [B, Na, Na, 1]
+        coord_diff = coord.reshape(B, Na, 1, 3) - coord.reshape(B, 1, Na, 3) # [B, Na, Na, 3]
+        coord_vecs = torch.sum(coord_diff * pair_coef, dim=2) / Na # [B, Na, 3]
+        return coord_vecs
