@@ -22,22 +22,18 @@ from ..data import ImpMol, ExpMol, MolEncoder, MolData, SaveDataSampleStreamer
 from ..path import DiscDenoisePath, LinearDenoisePath, MolPath
 from ..model import GraphAttnModel, GaussianPairEmbedding, TrigCoordEmbedding
 
-# distribution
-class InitMolDist(Distribution[MolData]):
-    def __init__(self, 
-            mol_encoder: MolEncoder, 
-            atom_state: Literal['masked', 'random'], 
-            seed: int, 
-            coord_std: float
-    ):
-        self.mol_encoder = mol_encoder
-        self.atom_state = atom_state
-        self.rng = np.random.default_rng(seed)
-        self.coord_std = coord_std
+class MaskedAtomDist(Distribution[Tensor]):
+    def __init__(self, mencoder: MolEncoder):
+        self.mencoder = mencoder
     def sample(self):
-        self.rng.random()
-        mol = ImpMol(self.atom_state, deepcopy(self.rng), self.coord_std)
-        return self.mol_encoder.encode(mol)
+        return torch.full((self.mencoder.n_atom,), fill_value=self.mencoder.mask_atom_idx, dtype=torch.long)
+
+class RandomCoordDist(Distribution[Tensor]):
+    def __init__(self, mencoder: MolEncoder, std: float):
+        self.mencoder = mencoder
+        self.std = std
+    def sample(self):
+        return torch.randn((self.mencoder.n_atom, 3)) * self.std
 
 class UniformTDist(Distribution[float]):
     def __init__(self, eps: float=1e-3):
@@ -49,8 +45,7 @@ class UniformTDist(Distribution[float]):
 class MolFMDataset[NT, CT, NBP, CBP](Dataset[tuple[MolData, float, tuple[NT, CT]]]):
     def __init__(self, 
             mol_data: Dataset[Chem.Mol],
-            no_coord_std: float, 
-            init_dist: Distribution[MolData],
+            no_coord_std: float,
             t_dist: Distribution[float],
             path: MolPath[NT, CT, NBP, CBP],
             mencoder: MolEncoder,
@@ -58,7 +53,6 @@ class MolFMDataset[NT, CT, NBP, CBP](Dataset[tuple[MolData, float, tuple[NT, CT]
         self.mol_data = mol_data
         self.no_coord_std = no_coord_std
         self.t_dist = t_dist
-        self.init_dist = init_dist
         self.path = path
         self.mencoder = mencoder
         self.rng = np.random.default_rng(0)
@@ -67,9 +61,8 @@ class MolFMDataset[NT, CT, NBP, CBP](Dataset[tuple[MolData, float, tuple[NT, CT]
         self.rng.random()
         mol = ExpMol(self.mol_data[idx], self.rng, self.no_coord_std)
         data1 = self.mencoder.encode(mol)
-        data0 = self.init_dist.sample()
         t = self.t_dist.sample()
-        data, target = self.path.sample(data0, data1, t)
+        data, target = self.path.sample(data1, t)
         return data, t, target
     
     def __len__(self):
@@ -155,14 +148,15 @@ if __name__ == '__main__':
     # Dataset
     mencoder = MolEncoder(120)
     mol_data = UniMolLigandDataset('train', 'rdkit')
-    init_dist = InitMolDist(mencoder, 'masked', 0, args.init_coord_std)
     t_dist = UniformTDist()
+    init_node_dist = MaskedAtomDist(mencoder)
+    init_coord_dist = RandomCoordDist(mencoder, args.init_coord_std)
     path = MolPath(
-        DiscDenoisePath(0.0, 0.0), 
-        LinearDenoisePath(0.0, 0.0),
+        DiscDenoisePath(init_node_dist, 0.0, 0.0), 
+        LinearDenoisePath(init_coord_dist, 0.0, 0.0),
         args.coord_weight,
     )
-    data = MolFMDataset(mol_data, args.no_coord_std, init_dist, t_dist, path, mencoder)
+    data = MolFMDataset(mol_data, args.no_coord_std, t_dist, path, mencoder)
     data = ExceptNoneDataset(data)
     item_loader = DataLoader(data, batch_size=None, sampler=InfiniteRandomSampler(data), num_workers=16)
     item_iter = iter(item_loader)

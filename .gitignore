@@ -2,5 +2,6 @@
 results/
 __pycache__/
 graph/
+/experiments/
 
 *.ipynb

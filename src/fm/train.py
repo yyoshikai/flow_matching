@@ -3,16 +3,20 @@ import itertools as itr
 from dataclasses import dataclass
 from collections.abc import Iterator
 from typing import Self, Any
+import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
 
 class Path[D, Tgt, BPred]:
-    def sample(self, data0: D, data1: D, t: float) -> tuple[D, Tgt]:
+    def sample(self, data1: D, t: float) -> tuple[D, Tgt]:
         raise NotImplementedError
-    
-    def update(self, datas: list[D], bpred: BPred, t: float, delta_t: float) -> list[D]:
+    def sample_init(self) -> D:
+        raise NotImplementedError
+    def bsample_init(self, n: int) -> list[D]:
+        return [self.sample_init() for _ in range(n)]
+    def update(self, datas: list[D], bpred: BPred, t: float, delta_t: float, alpha: float) -> list[D]:
         raise NotImplementedError
 
     def criterion(self, targets: list[Tgt], bpred: BPred) -> Loss:
@@ -79,3 +83,36 @@ class Distribution[D]:
 
     def bsample(self, n: int) -> list[D]:
         return [self.sample() for i in range(n)]
+
+class GStreamer[D, BPred]:
+    def init(self, data: D, batch_idx: int):
+        pass
+    def put(self, data: D, bpred: BPred, t: float, delta_t: float):
+        pass
+    def end(self):
+        pass
+
+@torch.inference_mode()
+def generate[D, Tgt, BPred](
+    fm_model: FMModel[D],
+    path: Path[D, Tgt, BPred],
+    gstreamers: list[GStreamer[D, BPred]],
+    ts: list[tuple[float, float]],
+    max_batch_size: int,
+    n: int
+):
+    
+    all_datas = []
+    for idxs in itr.batched(range(n), max_batch_size):
+        datas = path.bsample_init(len(idxs))
+        for bidx, idx in enumerate(idxs):
+            gstreamers[idx].init(datas[bidx], bidx)
+        for t, delta_t, alpha in ts:
+            bpred = fm_model(datas, [t]*len(idxs))
+            datas = path.update(datas, bpred, t, delta_t, alpha)
+            for idx, data in zip(idxs, datas):
+                gstreamers[idx].put(data, bpred, t, delta_t)
+        for idx in idxs:
+            gstreamers[idx].end()
+        all_datas += datas
+    return all_datas
