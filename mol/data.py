@@ -1,5 +1,6 @@
 import os, math
 from collections.abc import Container
+from collections import namedtuple
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
@@ -15,32 +16,49 @@ from src.fm.train import Streamer
 
 with open(Path(__file__).parent / "atoms.txt") as f:
     ATOMS = f.read().splitlines()
+MAX_ABS_CHARGE = 4
 
 # Mol
 class Mol:
     pass
+MolData = tuple[Tensor, Tensor, Tensor] # [node, coord, charge]
+
 class ExpMol(Mol):
+    logger = getLogger(f"{__module__}.{__qualname__}")
+
     def __init__(self, mol: Chem.Mol, rng: np.random.Generator, no_coord_std: float):
         self.mol = mol
         self.rng = rng
         self.no_coord_std = no_coord_std
+    def encode(self, n_atom, atom2idx: dict[str, int], no_atom_idx: int,)
+        rdmol = self.mol
+        n_mol_atom = rdmol.GetNumAtoms()
+        if n_mol_atom > n_atom:
+            self.logger.warning(f"{n_mol_atom=} > {n_atom=}")
+            n_mol_atom = n_atom
+        n_no_atom = n_atom-n_mol_atom
+        node = torch.tensor([atom2idx[rdmol.GetAtomWithIdx(i).GetSymbol()] for i in range(n_mol_atom)]+[no_atom_idx]*n_no_atom, dtype=torch.long)
+        
+        coord = rdmol.GetConformer().GetPositions() # [Na, 3]
+        coord = coord - np.mean(coord, axis=0)
+        coord = np.matmul(coord, get_random_rotation_matrix(self.rng))
+
+        coord = torch.tensor(np.concatenate([
+            coord,
+            self.rng.normal(size=(n_no_atom, 3))*self.no_coord_std
+        ]), dtype=torch.float32)
+
+        return (node, coord, charge)
 class ImpMol(Mol):
     def __init__(self, atom_state: Literal['masked', 'random'], rng: np.random.Generator, coord_std: float):
         self.atom_state = atom_state
         self.rng = rng
         self.coord_std = coord_std
 
-# MolData
-@dataclass
-class MolData:
-    node: Tensor # long[Na,]
-    coord: Tensor # [Na, 3]
-    def __post_init__(self):
-        assert isinstance(self.node, Tensor)
-        assert isinstance(self.coord, Tensor)
-        Na, = self.node.shape
-        assert self.coord.shape == (Na, 3)
-
+    def encode(self, n_atom, mask_atom_idx, ):
+        node = torch.full((n_atom,), fill_value=mask_atom_idx, dtype=torch.long)
+        coord = torch.tensor(self.rng.normal(size=(n_atom, 3)) * self.coord_std, dtype=torch.float32)
+        return(node, coord, charge)
 ## Encode Mol -> MolData
 class MolEncoder:
     logger = getLogger(f"{__module__}.{__qualname__}")
@@ -70,11 +88,11 @@ class MolEncoder:
                 coord,
                 mol.rng.normal(size=(n_no_atom, 3))*mol.no_coord_std
             ]), dtype=torch.float32)
-            return MolData(node, coord)
+            return (node, coord, charge)
         elif isinstance(mol, ImpMol):
             node = torch.full((self.n_atom,), fill_value=self.mask_atom_idx, dtype=torch.long)
             coord = torch.tensor(mol.rng.normal(size=(self.n_atom, 3)) * mol.coord_std, dtype=torch.float32)
-            return MolData(node, coord)
+            return(node, coord, charge)
         else:
             raise ValueError
 

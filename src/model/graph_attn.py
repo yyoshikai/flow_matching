@@ -86,7 +86,6 @@ class TrigCoordEmbedding(nn.Module):
         return x
 
 
-
 class GraphAttnLayer(nn.Module):
     def __init__(self, d_model, num_heads, d_ff_factor=4, dropout=0.0):
         super().__init__()
@@ -165,6 +164,7 @@ class GraphAttnLayer(nn.Module):
         x = x + self.ff(x)
 
         return x, edge
+
 
 class GraphAttnModel(nn.Module):
     def __init__(self):

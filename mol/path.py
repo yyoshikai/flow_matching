@@ -1,3 +1,4 @@
+from collections.abc import Iterator, Callable
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -34,20 +35,18 @@ class CubicKappa:
         return k, dk
 
 class DiscDenoisePath(Path[Tensor, Tensor, Tensor]):
-    def __init__(self, init_dist: Distribution[Tensor], a: float, b: float):
-        self.init_dist = init_dist
+    def __init__(self, init_iter: Iterator[Tensor], a: float, b: float):
+        self.init_iter = init_iter
         self.kappa = CubicKappa(a, b)
         self.rng = torch.Generator()
 
-    def sample(self, data1, t):
+    def sample(self, data0, data1, t):
         assert data1.dtype == torch.long
         k, dk = self.kappa(t)
-        data = self.init_dist.sample().to(data1)
+        data = data0.clone().detach() # 必要?
         is_data1 = torch.rand_like(data1, dtype=torch.float) < k
         data[is_data1] = data1[is_data1]
         return data, data1
-    def sample_init(self):
-        return self.init_dist.sample()
     def update(self, datas, bpred, t, delta_t, alpha):
         n = len(datas)
         k, dk = self.kappa(t)
@@ -55,7 +54,7 @@ class DiscDenoisePath(Path[Tensor, Tensor, Tensor]):
         p_0 = delta_t * (alpha-1) * dk / k
         assert 0 <= p_1+p_0 <= 1, f"{p_0=}, {p_1=}"
         for idx, data in enumerate(datas):
-            data0 = self.init_dist.sample()
+            data0 = next(self.init_iter)
             r = torch.rand_like(data, dtype=torch.float)
             data[r < p_1] = torch.multinomial(F.softmax(bpred[idx][r < p_1].to(data.device), dim=-1), num_samples=1).squeeze(-1)
             data[(p_1 <= r)& (r < p_1+p_0)] = data0[(p_1 <= r)& (r < p_1+p_0)]
@@ -73,16 +72,12 @@ class DiscDenoisePath(Path[Tensor, Tensor, Tensor]):
         return Loss([loss], ['loss'], [1.0])
 
 class LinearDenoisePath(Path[Tensor, Tensor, Tensor]):
-    def __init__(self, init_dist: Distribution[Tensor], a: float, b: float):
-        self.init_dist = init_dist
+    def __init__(self, a: float, b: float):
         self.kappa = CubicKappa(a, b)
-    def sample(self, data1, t):
+    def sample(self, data0, data1, t):
         k, dk = self.kappa(t)
-        data0 = self.init_dist.sample()
         data = data0 * (1-k) + data1 * k
         return data, data1
-    def sample_init(self):
-        return self.init_dist.sample()
     def update(self, datas, bpred, t, delta_t, alpha):
         bpred = bpred.to(datas[0].device)
         k, dk = self.kappa(t)
@@ -101,12 +96,10 @@ class MolPath[NT, CT, NBP, CBP](Path[MolData, tuple[NT, CT], tuple[NBP, CBP]]):
         self.node_path = node_path
         self.coord_path = coord_path
         self.coord_weight = coord_weight
-    def sample(self, data1, t):
-        node, node_tgt = self.node_path.sample(data1.node, t)
-        coord, coord_tgt = self.coord_path.sample(data1.coord, t)
+    def sample(self, data0, data1, t):
+        node, node_tgt = self.node_path.sample(data0.node, data1.node, t)
+        coord, coord_tgt = self.coord_path.sample(data0.coord, data1.coord, t)
         return MolData(node, coord), (node_tgt, coord_tgt)
-    def sample_init(self):
-        return MolData(self.node_path.sample_init(), self.coord_path.sample_init())
     def update(self, datas, bpred, t, delta_t, alpha):
         node_bpred, coord_bpred = bpred
         nodes = [data.node for data in datas]

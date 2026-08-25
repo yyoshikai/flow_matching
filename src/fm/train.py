@@ -10,12 +10,8 @@ from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader
 
 class Path[D, Tgt, BPred]:
-    def sample(self, data1: D, t: float) -> tuple[D, Tgt]:
+    def sample(self, data0: D, data1: D, t: float) -> tuple[D, Tgt]:
         raise NotImplementedError
-    def sample_init(self) -> D:
-        raise NotImplementedError
-    def bsample_init(self, n: int) -> list[D]:
-        return [self.sample_init() for _ in range(n)]
     def update(self, datas: list[D], bpred: BPred, t: float, delta_t: float, alpha: float) -> list[D]:
         raise NotImplementedError
 
