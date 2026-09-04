@@ -5,3 +5,4 @@ graph/
 /experiments/
 generate
 *.ipynb
+*.sh

@@ -1,34 +1,28 @@
 import os, random
 import itertools as itr
 from logging import Logger
-from collections.abc import Container
+from collections.abc import Container, Callable, Iterator
 from typing import overload
-import numpy as np
 import torch
 import torch.nn as nn
-from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from .train import Streamer, StopCriterion
 
 # Range
-class Range(Container):
-    def __contains__(self, x: int):
-        raise NotImplementedError
+class CatContainer[T](Container[T]):
+    def __init__(self, *containers: Container[T]):
+        self.containers = containers
+    def __contains__(self, x: T):
+        return any(x in c for c in self.containers)
 
-class CatRange(Range):
-    def __init__(self, *ranges: Container):
-        self.ranges = ranges
-    def __contains__(self, x: int):
-        return any(x in r for r in self.ranges)
-
-class GERange(Range):
+class GEContainer(Container[int]):
     def __init__(self, n: int):
         super().__init__()
         self.n = n
     def __contains__(self, x: int):
         return x >= self.n
 
-class RepeatRange(Range):
+class RepeatContainer(Container):
     @overload
     def __init__(self, step: int): ...
     @overload
@@ -43,7 +37,7 @@ class RepeatRange(Range):
             return True
         return False
 
-class AmpRange(Range):
+class AmpContainer(Container[int]):
     def __init__(self, min_step: int=1, max_step: int|None=None):
         self.min_step = min_step
         self.max_step = max_step
@@ -58,7 +52,6 @@ class AmpRange(Range):
                 return True
             else:
                 return False
-
 
 # Streamer
 class Streamers(list[Streamer], Streamer):
@@ -75,25 +68,25 @@ class Streamers(list[Streamer], Streamer):
             streamer.put_optim(model, optimizer)
 
 class SaveModelStreamer(Streamer):
-    def __init__(self, path_format: str, range: Container):
+    def __init__(self, path_format: str, steps: Container):
         self.path_format = path_format
-        self.range = range
+        self.steps = steps
         self.step = 0
     def put_optim(self, model, optimizer):
         self.step += 1
-        if self.step in self.range:
+        if self.step in self.steps:
             path = self.path_format.format(step=self.step)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(model.state_dict(), path)
 
 class LogStepStreamer(Streamer):
-    def __init__(self, logger: Logger, range: Container):
+    def __init__(self, logger: Logger, step: Container):
         self.logger = logger
-        self.range = range
+        self.step = step
         self.step = 0
     def put_optim(self, model, optimizer):
         self.step += 1
-        if self.step in self.range:
+        if self.step in self.step:
             self.logger.debug(f"Finished step={self.step}")
 
 class SaveLossStreamer(Streamer):
@@ -115,13 +108,13 @@ class SaveLossStreamer(Streamer):
         self.step += 1
 
 class SaveGradStreamer(Streamer):
-    def __init__(self, path_format: str, range: Container):
+    def __init__(self, path_format: str, step: Container):
         self.path_format = path_format
-        self.range = range
+        self.step = step
         self.step = 0
     def put_loss(self, model, loss):
         self.step += 1
-        if self.step not in self.range:
+        if self.step not in self.step:
             return
         names, params = zip(*[(name, p) for name, p in model.named_parameters() if p.requires_grad])
         for k, l in zip(loss.names, loss.losses):
@@ -169,3 +162,8 @@ class StepStopCriterion(StopCriterion):
     def __call__(self, model, batch_data, loss):
         self.cur_step += 1
         return self.max_step <= self.cur_step
+
+# others
+def call_repeat[T](f: Callable[[], T]) -> Iterator[T]:
+    while True:
+        yield f()

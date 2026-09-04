@@ -1,25 +1,22 @@
 import math
 import itertools as itr
 from dataclasses import dataclass
-from collections.abc import Iterator
-from typing import Self, Any
+from collections.abc import Iterator, Callable
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
-from torch.utils.data import Dataset, DataLoader
 
 class Path[D, Tgt, BPred]:
-    def sample(self, data0: D, data1: D, t: float) -> tuple[D, Tgt]:
+    def sample(self, data0: D, data1: D, t0: float, t1: float) -> tuple[D, Tgt]:
         raise NotImplementedError
-    def update(self, datas: list[D], bpred: BPred, t: float, delta_t: float, alpha: float) -> list[D]:
+    def update(self, datas: list[D], bpred: BPred, t0: float, t1: float) -> list[D]:
         raise NotImplementedError
-
-    def criterion(self, targets: list[Tgt], bpred: BPred) -> Loss:
+    def build_criterion(self) -> Callable[[list[Tgt], BPred], Loss]:
         raise NotImplementedError
 
 class FMModel[D, BPred](nn.Module):
-    def forward(self, datas: list[D], ts: list[float]) -> BPred:
+    def forward(self, datas: list[D], ts: list[int]) -> BPred:
         raise NotImplementedError
 
 @dataclass
@@ -54,24 +51,35 @@ def train_fm[D, Tgt, BPred](
     fm_model: FMModel[D], 
     optimizer: Optimizer,
     data_iter: Iterator[tuple[D, float, Tgt]],
-    path: Path[D, Tgt, BPred],
+    criterion: nn.Module,
     streamer: Streamer,
     stop_criterion: StopCriterion,
 ):
     fm_model.train()
     while True:
         batch_data = data_iter.__next__()
+        print('a', flush=True)
         streamer.put_data(batch_data)
+        print('b', flush=True)
         datas, ts, targets = zip(*batch_data)
+        print('c', flush=True)
         optimizer.zero_grad()
+        print('d', flush=True)
         bpred = fm_model(datas, ts)
-        loss = path.criterion(targets, bpred)
+        print('e', flush=True)
+        loss = criterion(targets, bpred)
+        print('f', flush=True)
         streamer.put_loss(fm_model, loss)
+        print('g', flush=True)
         loss.loss().backward()
+        print('h', flush=True)
         optimizer.step()
+        print('i', flush=True)
         streamer.put_optim(fm_model, optimizer)
+        print('j', flush=True)
         if stop_criterion(fm_model, batch_data, loss):
             break
+        print('k', flush=True)
 
 class Distribution[D]:
     def sample(self) -> D:
