@@ -18,8 +18,10 @@ from scipy.optimize import linear_sum_assignment
 from egnn_pytorch import EGNN
 from src.utils.logger import get_logger, add_file_handler
 from src.utils.random import set_random_seed
+from src.utils.path import cleardir
 from src.fm.train import train_fm, Path, FMModel, Loss, Streamer
 from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreamer, SaveLossStreamer, SaveGradStreamer, AmpContainer, RepeatContainer, CatContainer, StepStopCriterion
+from src.data import ErrorNoneDataset
 from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
 
@@ -72,8 +74,7 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
         # get n_mol_atom: truncate extra atoms
         n_mol_atom = mol.GetNumAtoms()
         if n_mol_atom > self.n_atom:
-            self.logger.warning(f"[{idx}] {n_mol_atom=} > {self.n_atom=}")
-            n_mol_atom = self.n_atom
+            raise ValueError(f"{n_mol_atom=} > {self.n_atom=}")
         n_pad_atom = self.n_atom - n_mol_atom
 
         # data1 node
@@ -150,6 +151,7 @@ class PathSampleDataset[D, Tgt, BPred](Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
 
 # Path
 class DiscPath[Tgt, BPred](Path[Tensor, Tgt, BPred]):
@@ -241,7 +243,7 @@ class _TupleCriterion(nn.Module):
         bpred: [n_path]
         
         """
-        targets = zip(*targets) # [n_path, n_data]
+        targets = list(zip(*targets)) # [n_path, n_data]
         losses = []
         for i in range(len(self.criteria)):
             loss = self.criteria[i](targets[i], bpred[i])
@@ -330,13 +332,14 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--studyname", required=True)
     args = parser.parse_args()
-    batch_size = 256
-    lr = 1.5e-4 # original: batch_size=512, max_lr=3e-4
-    n_atom = 120
+    batch_size = 64
+    lr = 3e-4 * batch_size / 512 # original: batch_size=512, max_lr=3e-4
+    n_atom = 80
     init_coord_std = 3.0
 
     # training
     result_dir = f"mol/results/{args.studyname}"
+    cleardir(result_dir)
     logger = get_logger(stream=True)
     add_file_handler(logger, f"{result_dir}/debug.log")
     set_random_seed(0)
@@ -356,8 +359,11 @@ if __name__ == '__main__':
 
     # data2: PathSample
     dataset = PathSampleDataset(dataset, path)
-    data_loader = DataLoader(dataset, batch_size=None)
-    data_iter = itr.batched(itr.chain.from_iterable(itr.repeat(data_loader)), batch_size)
+    dataset = ErrorNoneDataset(dataset)
+    data_loader = DataLoader(dataset, batch_size=None, shuffle=True)
+    data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
+    data_iter = itr.filterfalse(lambda x: x is None, data_iter)
+    data_iter = itr.batched(data_iter, batch_size)
 
     # model
     model = MolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, atom_path.build_head(512), charge_path.build_head(512)).to(device)
@@ -372,7 +378,7 @@ if __name__ == '__main__':
 
     # other
     streamer = Streamers([
-        LogStepStreamer(logger, AmpContainer(10, 10000)), 
+        LogStepStreamer(logger, AmpContainer(1, 10000)), 
         SaveModelStreamer(result_dir+"/models/{step}.pth", RepeatContainer(10000)),
         SaveLossStreamer(result_dir+"/loss.csv"),
         SaveGradStreamer(result_dir+"/grads/{step}/{k}.pth", CatContainer([1], AmpContainer(100, 10000))),
@@ -380,5 +386,6 @@ if __name__ == '__main__':
     ])
     stop_criterion = StepStopCriterion(10000)
 
-    train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
 

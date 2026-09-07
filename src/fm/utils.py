@@ -80,13 +80,13 @@ class SaveModelStreamer(Streamer):
             torch.save(model.state_dict(), path)
 
 class LogStepStreamer(Streamer):
-    def __init__(self, logger: Logger, step: Container):
+    def __init__(self, logger: Logger, steps: Container):
         self.logger = logger
-        self.step = step
+        self.steps = steps
         self.step = 0
     def put_optim(self, model, optimizer):
         self.step += 1
-        if self.step in self.step:
+        if self.step in self.steps:
             self.logger.debug(f"Finished step={self.step}")
 
 class SaveLossStreamer(Streamer):
@@ -108,13 +108,13 @@ class SaveLossStreamer(Streamer):
         self.step += 1
 
 class SaveGradStreamer(Streamer):
-    def __init__(self, path_format: str, step: Container):
+    def __init__(self, path_format: str, steps: Container):
         self.path_format = path_format
-        self.step = step
+        self.steps = steps
         self.step = 0
     def put_loss(self, model, loss):
         self.step += 1
-        if self.step not in self.step:
+        if self.step not in self.steps:
             return
         names, params = zip(*[(name, p) for name, p in model.named_parameters() if p.requires_grad])
         for k, l in zip(loss.names, loss.losses):

@@ -58,28 +58,17 @@ def train_fm[D, Tgt, BPred](
     fm_model.train()
     while True:
         batch_data = data_iter.__next__()
-        print('a', flush=True)
         streamer.put_data(batch_data)
-        print('b', flush=True)
         datas, ts, targets = zip(*batch_data)
-        print('c', flush=True)
         optimizer.zero_grad()
-        print('d', flush=True)
         bpred = fm_model(datas, ts)
-        print('e', flush=True)
         loss = criterion(targets, bpred)
-        print('f', flush=True)
         streamer.put_loss(fm_model, loss)
-        print('g', flush=True)
         loss.loss().backward()
-        print('h', flush=True)
         optimizer.step()
-        print('i', flush=True)
         streamer.put_optim(fm_model, optimizer)
-        print('j', flush=True)
         if stop_criterion(fm_model, batch_data, loss):
             break
-        print('k', flush=True)
 
 class Distribution[D]:
     def sample(self) -> D:
