@@ -223,20 +223,22 @@ class _DenoiseCoordCriterion(nn.Module):
         return Loss([loss], ['loss'], [1.0])
 
 class TuplePath(Path):
-    def __init__(self, paths: list[Path], names: list[str]):
+    def __init__(self, paths: list[Path], names: list[str], weights: list[float]):
         self.paths = paths
         self.names = names
+        self.weights = weights
     def sample(self, data0, data1, t0, t1):
         outs = [path.sample(d0, d1, t0, t1) for path, d0, d1 in zip(self.paths, data0, data1)]
         return tuple(zip(*outs))
     def build_criterion(self):
-        return _TupleCriterion([path.build_criterion() for path in self.paths], self.names)
+        return _TupleCriterion([path.build_criterion() for path in self.paths], self.names, self.weights)
 
 class _TupleCriterion(nn.Module):
-    def __init__(self, criteria: list[nn.Module], names: list[str]):
+    def __init__(self, criteria: list[nn.Module], names: list[str], weights: list[float]):
         super().__init__()
         self.criteria = criteria
         self.names = names
+        self.weights = weights
     def forward(self, targets, bpred):
         """
         targets: [n_data, n_path]
@@ -244,16 +246,13 @@ class _TupleCriterion(nn.Module):
         
         """
         targets = list(zip(*targets)) # [n_path, n_data]
-        losses = []
-        for i in range(len(self.criteria)):
-            loss = self.criteria[i](targets[i], bpred[i])
-            loss.names = [self.names[i]+'_'+name for name in loss.names]
-            losses.append(loss)
-        return Loss.cat(*losses)
+        losses = [criterion(ts, bp) for criterion, ts, bp in zip(self.criteria, targets, bpred)]
+        loss = Loss.cat(losses, self.names, self.weights)
+        return loss
 
 class MolPath(TuplePath):
-    def __init__(self, atom_path: DiscPath, coord_path: Path, charge_path: DiscPath):
-        super().__init__([atom_path, coord_path, charge_path], ["atom", "coord", "charge"])
+    def __init__(self, atom_path: DiscPath, coord_path: Path, charge_path: DiscPath, coord_weight: float):
+        super().__init__([atom_path, coord_path, charge_path], ["atom", "coord", "charge"], [1, coord_weight, 1])
 
 def cubic_kappa(t: float, a: float, b: float):
     # 常に k'(t) >= 0 となる条件: 
@@ -354,7 +353,8 @@ if __name__ == '__main__':
     path = MolPath(
         atom_path:=DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
         coord_path:=DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
-        charge_path:=DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1))
+        charge_path:=DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
+        1e-9
     )
 
     # data2: PathSample

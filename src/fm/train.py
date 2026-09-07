@@ -29,10 +29,14 @@ class Loss:
         return sum(loss*weight for loss, weight in zip(self.losses, self.weights))
     
     @classmethod
-    def cat(cls, *cinfos: Loss):
-        losses = list(itr.chain(*[cinfo.losses for cinfo in cinfos]))
-        names = list(itr.chain(*[cinfo.names for cinfo in cinfos]))
-        weights = list(itr.chain(*[cinfo.weights for cinfo in cinfos]))
+    def cat(cls, cinfos: list[Loss], cnames: list[str], cweights: list[float]):
+        losses = []
+        names = []
+        weights = []
+        for i, cinfo in enumerate(cinfos):
+            losses += cinfo.losses
+            names += [cnames[i]+'_'+name for name in cinfo.names]
+            weights += [w*cweights[i] for w in cinfo.weights]
         return Loss(losses, names, weights)
 
 class Streamer[D, Tgt]:
