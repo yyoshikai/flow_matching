@@ -1,4 +1,4 @@
-import os
+import os, yaml
 import itertools as itr
 from argparse import ArgumentParser
 from functools import partial
@@ -25,7 +25,7 @@ from src.data import ErrorNoneDataset
 from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
 
-# data_iter
+# Data
 Mol = tuple[Tensor, Tensor, Tensor]
 
 with open(_Path(__file__).parent / "atoms.txt") as f:
@@ -101,16 +101,9 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
             self.logger.warning(f"[{idx}] {min_charge=} < {-MAX_ABS_CHARGE=}")
         charge1.clamp_(-MAX_ABS_CHARGE, MAX_ABS_CHARGE).add_(MAX_ABS_CHARGE)
 
-        # data0 node
-        if self.mask_init:
-            atom0 = torch.tensor([self.atom2idx['MASK']]*self.n_atom, dtype=torch.long)
-        else:
-            atom0 = torch.tensor(self.rng.integers(0, self.n_atom_idx, size=self.n_atom))
-
-        # data0 coord, charge
-        coord0 = self.rng.normal(size=(self.n_atom, 3))*self.init_coord_std
-        coord0 -= np.mean(coord0, axis=0)
-        charge0 = torch.full((self.n_atom, ), MAX_ABS_CHARGE, dtype=torch.long)
+        # data0
+        atom0, coord0, charge0 = self.sample0()
+        coord0 = coord0.numpy()
 
         # OT permutation
         dist = np.sqrt((coord1**2).sum(axis=1)[:, np.newaxis]+(coord0**2).sum(axis=1)[np.newaxis,:] - np.matmul(coord1, coord0.T)*2) # [N1, N0]
@@ -136,6 +129,20 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
     def idx2charge(self, idx: int):
         return idx-MAX_ABS_CHARGE
 
+    def sample0(self) -> Mol:
+        # data0 node
+        if self.mask_init:
+            atom0 = torch.tensor([self.atom2idx['MASK']]*self.n_atom, dtype=torch.long)
+        else:
+            atom0 = torch.tensor(self.rng.integers(0, self.n_atom_idx, size=self.n_atom))
+
+        # data0 coord, charge
+        coord0 = self.rng.normal(size=(self.n_atom, 3))*self.init_coord_std
+        coord0 -= np.mean(coord0, axis=0)
+        charge0 = torch.full((self.n_atom, ), MAX_ABS_CHARGE, dtype=torch.long)
+        coord0 = torch.tensor(coord0, dtype=torch.float)
+        return atom0, coord0, charge0
+
 class PathSampleDataset[D, Tgt, BPred](Dataset):
     def __init__(self, dataset: Dataset[tuple[D, D]], path: Path[D, Tgt, BPred]):
         self.dataset = dataset
@@ -151,7 +158,6 @@ class PathSampleDataset[D, Tgt, BPred](Dataset):
 
     def __len__(self):
         return len(self.dataset)
-
 
 # Path
 class DiscPath[Tgt, BPred](Path[Tensor, Tgt, BPred]):
@@ -181,11 +187,14 @@ class DenoiseDiscPath(DiscPath[Tensor, Tensor]):
         # target
         return data, data1
     def update(self, datas, bpred, t0, t1):
+        bpred = bpred.to(datas[0].device)
         k = self.kappa(t0)
         dk = self.kappa(t1)-k
+        print(f"{t0=}, {t1=} {k=}, {dk=}, {datas[0][0]=}, {bpred[0, 0]=}")
         for idx, data in enumerate(datas):
             data1_mask = torch.rand_like(data, dtype=torch.float) < dk / (1-k)
-            data[data1_mask] = torch.multinomial(F.softmax(bpred[idx][data1_mask], dim=-1), num_samples=1).squeeze(-1)
+            prob = F.softmax(bpred[idx][data1_mask], dim=-1)
+            data[data1_mask] = torch.multinomial(prob, num_samples=1).squeeze(-1)
         return datas
     def build_head(self, node_dim):
         return nn.Sequential(
@@ -212,7 +221,13 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
         k = self.kappa(t0)
         data = data0*(1-k)+data1*k
         return data, data1
-
+    def update(self, datas, bpred, t0, t1):
+        bpred = bpred.to(datas[0].device)
+        k0 = self.kappa(t0)
+        k1 = self.kappa(t1)
+        print(f"{t0=}, {t1=} {k0=}, {k1=}, {datas[0][0]=}, {bpred[0, 0]=}")
+        datas = [data+(bpred[b]-data)*(k1-k0)/(1-k0) for b, data in enumerate(datas)]
+        return datas
     def build_criterion(self):
         return _DenoiseCoordCriterion()
 
@@ -230,6 +245,12 @@ class TuplePath(Path):
     def sample(self, data0, data1, t0, t1):
         outs = [path.sample(d0, d1, t0, t1) for path, d0, d1 in zip(self.paths, data0, data1)]
         return tuple(zip(*outs))
+    def update(self, datas, bpred, t0, t1):
+        p2datas = list(zip(*datas))
+        datas = [path.update(datas, bpred0, t0, t1) for path, datas, bpred0
+                in zip(self.paths, p2datas, bpred)] # [P, B]
+        return list(zip(*datas)) # [B, P]
+        
     def build_criterion(self):
         return _TupleCriterion([path.build_criterion() for path in self.paths], self.names, self.weights)
 
@@ -259,6 +280,14 @@ def cubic_kappa(t: float, a: float, b: float):
     # 概ね -1 <= a <= 2, -1 <= b <= 2 の領域 (より少し大きい)
     # ... Appendix D. で探索していた範囲
     return t-t**2*(1-t)*a+t*(1-t)**2*b
+
+def get_mol_path(mdata: MolDataset):
+    return MolPath(
+        DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
+        DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
+        DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
+        1e-9
+    )
 
 # Model
 class MolFMModel[MolTgt](FMModel[Mol, MolTgt]):
@@ -326,7 +355,6 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
 if __name__ == '__main__':
-
     # parameters
     parser = ArgumentParser()
     parser.add_argument("--studyname", required=True)
@@ -337,25 +365,22 @@ if __name__ == '__main__':
     init_coord_std = 3.0
 
     # training
-    result_dir = f"mol/results/{args.studyname}"
+    result_dir = f"mol/trains/{args.studyname}"
     cleardir(result_dir)
     logger = get_logger(stream=True)
     add_file_handler(logger, f"{result_dir}/debug.log")
     set_random_seed(0)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    with open(f"{result_dir}/args.yaml", 'w') as f:
+        yaml.dump(vars(args) | dict(batch_size=batch_size, lr=lr, n_atom=n_atom, init_coord_std=init_coord_std), f, sort_keys=False)
 
     # data_iter
     dataset = UniMolLigandDataset('train', 'rdkit')
     dataset = mdata = MolDataset(dataset, n_atom, init_coord_std, mask_init=False)
 
     # path
-    path = MolPath(
-        atom_path:=DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
-        coord_path:=DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
-        charge_path:=DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
-        1e-9
-    )
+    path = get_mol_path(mdata)
+    atom_path, coord_path, charge_path = path.paths
 
     # data2: PathSample
     dataset = PathSampleDataset(dataset, path)
