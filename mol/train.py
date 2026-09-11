@@ -1,6 +1,6 @@
 import os, yaml
 import itertools as itr
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from functools import partial
 from collections.abc import Callable, Container
 from logging import getLogger
@@ -190,7 +190,6 @@ class DenoiseDiscPath(DiscPath[Tensor, Tensor]):
         bpred = bpred.to(datas[0].device)
         k = self.kappa(t0)
         dk = self.kappa(t1)-k
-        print(f"{t0=}, {t1=} {k=}, {dk=}, {datas[0][0]=}, {bpred[0, 0]=}")
         for idx, data in enumerate(datas):
             data1_mask = torch.rand_like(data, dtype=torch.float) < dk / (1-k)
             prob = F.softmax(bpred[idx][data1_mask], dim=-1)
@@ -225,11 +224,16 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
         bpred = bpred.to(datas[0].device)
         k0 = self.kappa(t0)
         k1 = self.kappa(t1)
-        print(f"{t0=}, {t1=} {k0=}, {k1=}, {datas[0][0]=}, {bpred[0, 0]=}")
         datas = [data+(bpred[b]-data)*(k1-k0)/(1-k0) for b, data in enumerate(datas)]
         return datas
+    def build_head(self) -> nn.Module:
+        return _DenoiseCoordHead()
     def build_criterion(self):
         return _DenoiseCoordCriterion()
+
+class _DenoiseCoordHead(nn.Module):
+    def forward(self, coords, coords0, x_node):
+        return coords
 
 class _DenoiseCoordCriterion(nn.Module):
     def forward(self, targets: list[Tensor], bpred: Tensor):
@@ -291,37 +295,45 @@ def get_mol_path(mdata: MolDataset):
 
 # Model
 class MolFMModel[MolTgt](FMModel[Mol, MolTgt]):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, atom_head: nn.Module, charge_head: nn.Module):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, atom_head: nn.Module, coord_head: nn.Module, charge_head: nn.Module, norm_coors: bool):
         super().__init__()
         d_model = 512
         n_layer = 6
 
         # backbone
-        self.layers = nn.ModuleList([EGNN(dim=d_model) for _ in range(n_layer)])
+        self.layers = nn.ModuleList([EGNN(dim=d_model, norm_coors=norm_coors) for _ in range(n_layer)])
         # embedding, head
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
+        self.t_emb = nn.Linear(1, d_model)
         self.atom_head = atom_head
+        self.coord_head = coord_head
         self.charge_head = charge_head
 
     def forward(self, datas, ts):
         device = self.device()
         atoms, coords, charges = zip(*datas)
         atoms = torch.stack(atoms).to(device)
-        coords = torch.stack(coords).to(device)
+        coords = torch.stack(coords).to(device) # [B, N, 3]
         charges = torch.stack(charges).to(device)
+        ts = torch.tensor(ts).to(device) # [B,]
         coords0 = coords
-
         x_node = self.atom_emb(atoms)+self.charge_emb(charges)
-        for layer in self.layers:
+        t_emb = self.t_emb(ts.unsqueeze(1)).unsqueeze(1) # [B,] -> [B,1] -> [B, 512] -> [B, 1(N), 512]
+        x_node = x_node + t_emb
+        for i, layer in enumerate(self.layers):
             x_node, coords = layer(x_node, coords)
-        d_coords = coords - coords0 # [N, L] translation invariant
-        d_coords = d_coords - torch.mean(d_coords, dim=0)
+            # torch.save(coords, f"coords_{i}.pt")
+        coords = coords - torch.mean(coords, dim=1, keepdim=True)
 
-        return self.atom_head(x_node), d_coords, self.charge_head(x_node)
+        return self.atom_head(x_node), self.coord_head(coords, coords0, x_node), self.charge_head(x_node)
 
     def device(self) -> torch.device:
         return next(self.parameters()).device
+
+def get_model(args: Namespace, mdata: MolDataset, path: MolPath):
+    atom_path, coord_path, charge_path = path.paths
+    return MolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, atom_path.build_head(512), coord_path.build_head(), charge_path.build_head(512), args.norm_coors)
 
 class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
     def __init__(self, dir_format: str, steps: Container[int], n_sample_per_step: int, mdata: MolDataset):
@@ -354,10 +366,12 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
             }).to_csv(f"{dir}/{idx}.tsv", sep='\t', index=False)
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
-if __name__ == '__main__':
+
+def main():
     # parameters
     parser = ArgumentParser()
     parser.add_argument("--studyname", required=True)
+    parser.add_argument("--norm-coors", action='store_true')
     args = parser.parse_args()
     batch_size = 64
     lr = 3e-4 * batch_size / 512 # original: batch_size=512, max_lr=3e-4
@@ -380,7 +394,6 @@ if __name__ == '__main__':
 
     # path
     path = get_mol_path(mdata)
-    atom_path, coord_path, charge_path = path.paths
 
     # data2: PathSample
     dataset = PathSampleDataset(dataset, path)
@@ -391,7 +404,7 @@ if __name__ == '__main__':
     data_iter = itr.batched(data_iter, batch_size)
 
     # model
-    model = MolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, atom_path.build_head(512), charge_path.build_head(512)).to(device)
+    model = get_model(args, mdata, path).to(device)
     criterion = path.build_criterion()
 
     optim = torch.optim.Adam(model.parameters(), lr=lr)
@@ -414,3 +427,5 @@ if __name__ == '__main__':
     with torch.autocast('cuda', dtype=torch.bfloat16):
         train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
 
+if __name__ == '__main__':
+    main()

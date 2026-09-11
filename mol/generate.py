@@ -59,7 +59,6 @@ if __name__ == '__main__':
             datas = path.update(datas, bpred, t0, t1) # [B, P, D]
             bprocess.append(deepcopy(datas))
 
-
         processes += list(zip(*bprocess)) # [B, T, P, D]
     atom, coord, charge = zip(*itr.chain(*processes)) # [P, B*T, D]
     np.save(f"{gen_dir}/atom.npy", torch.stack(atom).reshape(B, T, n_atom).numpy())
