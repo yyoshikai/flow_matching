@@ -160,14 +160,7 @@ class PathSampleDataset[D, Tgt, BPred](Dataset):
         return len(self.dataset)
 
 # Path
-class DiscPath[Tgt, BPred](Path[Tensor, Tgt, BPred]):
-    """
-    Path for atoms & charges    
-    """
-    def build_head(self, node_dim: int) -> Callable[[Tensor], BPred]:
-        raise NotImplementedError
-
-class DenoiseDiscPath(DiscPath[Tensor, Tensor]):
+class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
     """
     D: [L]
     Tgt: [L]
@@ -195,12 +188,6 @@ class DenoiseDiscPath(DiscPath[Tensor, Tensor]):
             prob = F.softmax(bpred[idx][data1_mask], dim=-1)
             data[data1_mask] = torch.multinomial(prob, num_samples=1).squeeze(-1)
         return datas
-    def build_head(self, node_dim):
-        return nn.Sequential(
-            nn.Linear(node_dim, 512), 
-            nn.GELU(), 
-            nn.Linear(node_dim, self.n_atom_idx)
-        )
     def build_criterion(self):
         return _DenoiseDiscCriterion()
 
@@ -226,14 +213,8 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
         k1 = self.kappa(t1)
         datas = [data+(bpred[b]-data)*(k1-k0)/(1-k0) for b, data in enumerate(datas)]
         return datas
-    def build_head(self) -> nn.Module:
-        return _DenoiseCoordHead()
     def build_criterion(self):
         return _DenoiseCoordCriterion()
-
-class _DenoiseCoordHead(nn.Module):
-    def forward(self, coords, coords0, x_node):
-        return coords
 
 class _DenoiseCoordCriterion(nn.Module):
     def forward(self, targets: list[Tensor], bpred: Tensor):
@@ -276,7 +257,7 @@ class _TupleCriterion(nn.Module):
         return loss
 
 class MolPath(TuplePath):
-    def __init__(self, atom_path: DiscPath, coord_path: Path, charge_path: DiscPath, coord_weight: float):
+    def __init__(self, atom_path: Path, coord_path: Path, charge_path: Path, coord_weight: float):
         super().__init__([atom_path, coord_path, charge_path], ["atom", "coord", "charge"], [1, coord_weight, 1])
 
 def cubic_kappa(t: float, a: float, b: float):
@@ -294,8 +275,8 @@ def get_mol_path(mdata: MolDataset):
     )
 
 # Model
-class MolFMModel[MolTgt](FMModel[Mol, MolTgt]):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, atom_head: nn.Module, coord_head: nn.Module, charge_head: nn.Module, norm_coors: bool):
+class EGNNMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, norm_coors: bool):
         super().__init__()
         d_model = 512
         n_layer = 6
@@ -306,9 +287,16 @@ class MolFMModel[MolTgt](FMModel[Mol, MolTgt]):
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
-        self.atom_head = atom_head
-        self.coord_head = coord_head
-        self.charge_head = charge_head
+        self.atom_head = nn.Sequential(
+            nn.Linear(d_model, 512), 
+            nn.GELU(), 
+            nn.Linear(d_model, n_atom_idx)
+        )
+        self.charge_head = nn.Sequential(
+            nn.Linear(d_model, 512), 
+            nn.GELU(), 
+            nn.Linear(d_model, n_charge_idx)
+        )
 
     def forward(self, datas, ts):
         device = self.device()
@@ -321,19 +309,29 @@ class MolFMModel[MolTgt](FMModel[Mol, MolTgt]):
         x_node = self.atom_emb(atoms)+self.charge_emb(charges)
         t_emb = self.t_emb(ts.unsqueeze(1)).unsqueeze(1) # [B,] -> [B,1] -> [B, 512] -> [B, 1(N), 512]
         x_node = x_node + t_emb
+        # torch.save(coords, f"coords_0.pt")
         for i, layer in enumerate(self.layers):
             x_node, coords = layer(x_node, coords)
-            # torch.save(coords, f"coords_{i}.pt")
+            # torch.save(coords, f"coords_{i+1}.pt")
+        # raise ValueError
         coords = coords - torch.mean(coords, dim=1, keepdim=True)
 
-        return self.atom_head(x_node), self.coord_head(coords, coords0, x_node), self.charge_head(x_node)
+        return self.atom_head(x_node), coords, self.charge_head(x_node)
 
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
+class UniMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int):
+
+
 def get_model(args: Namespace, mdata: MolDataset, path: MolPath):
-    atom_path, coord_path, charge_path = path.paths
-    return MolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, atom_path.build_head(512), coord_path.build_head(), charge_path.build_head(512), args.norm_coors)
+    if args.model == "egnn":
+        return EGNNMolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, args.norm_coors)
+    elif args.model == "unimol":
+        pass
+    else:
+        raise ValueError(f"{args.model=}")
 
 class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
     def __init__(self, dir_format: str, steps: Container[int], n_sample_per_step: int, mdata: MolDataset):
@@ -372,6 +370,7 @@ def main():
     parser = ArgumentParser()
     parser.add_argument("--studyname", required=True)
     parser.add_argument("--norm-coors", action='store_true')
+    parser.add_argument("--model", choices=["egnn", "unimol"])
     args = parser.parse_args()
     batch_size = 64
     lr = 3e-4 * batch_size / 512 # original: batch_size=512, max_lr=3e-4

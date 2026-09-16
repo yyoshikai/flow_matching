@@ -4,7 +4,7 @@ from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 import numpy as np
 import torch
-from .train import get_mol_path, MolDataset, MolFMModel
+from .train import get_mol_path, MolDataset, get_model
 from src.data.datasets.unimol import UniMolLigandDataset
 
 if __name__ == '__main__':
@@ -35,7 +35,7 @@ if __name__ == '__main__':
     atom_path, coord_path, charge_path = path.paths
 
     # model
-    model = MolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, atom_path.build_head(512), charge_path.build_head(512)).to(device)
+    model = get_model(targs, mdata, path).to(device)
     model.load_state_dict(torch.load(f"{train_dir}/models/{args.step}.pth", map_location=device))
     model.eval()
 
