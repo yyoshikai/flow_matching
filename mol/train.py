@@ -290,12 +290,12 @@ class EGNNMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
         self.atom_head = nn.Sequential(
             nn.Linear(d_model, 512), 
             nn.GELU(), 
-            nn.Linear(d_model, n_atom_idx)
+            nn.Linear(512, n_atom_idx)
         )
         self.charge_head = nn.Sequential(
             nn.Linear(d_model, 512), 
             nn.GELU(), 
-            nn.Linear(d_model, n_charge_idx)
+            nn.Linear(512, n_charge_idx)
         )
 
     def forward(self, datas, ts):
@@ -321,15 +321,123 @@ class EGNNMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-class UniMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int):
+from mol.graph_attn import get_dist, TrigCoordEmbedding, GraphAttnModel
 
+class AtomPairEmbedding(nn.Module):
+    def __init__(self, d_pair: int, n_atom_idx: int, n_charge_idx: int):
+        super().__init__()
+        emb_size = 128
+
+        self.n_atom_idx = n_atom_idx
+        self.atom_weight_emb = nn.Embedding(n_atom_idx**2, emb_size)
+        self.atom_bias_emb = nn.Embedding(n_atom_idx**2, emb_size)
+        self.n_charge_idx = n_charge_idx
+        self.charge_weight_emb = nn.Embedding(n_charge_idx**2, emb_size)
+        self.charge_bias_emb = nn.Embedding(n_charge_idx**2, emb_size)
+        self.means = nn.Parameter(torch.zeros((emb_size,), dtype=torch.float))
+        self.stds = nn.Parameter(torch.ones((emb_size,), dtype=torch.float))
+        self.linear = nn.Linear(emb_size, d_pair)
+        # Initialization from Uni-Mol
+        # nn.init.uniform_(self.means, 0, 3)
+        # nn.init.uniform_(self.stds, 0, 3)
+        # nn.init.constant_(self.atom_weight_emb.weight, 1)
+        # nn.init.constant_(self.atom_bias_emb.weight, 0)
+        # nn.init.constant_(self.charge_weight_emb.weight, 1)
+        # nn.init.constant_(self.charge_bias_emb.weight, 0)
+                
+        # Initialization in 3dVAE
+        nn.init.normal_(self.atom_weight_emb.weight, 0.0, 1.0)
+        nn.init.normal_(self.atom_bias_emb.weight, 0.0, 1.0)
+        nn.init.normal_(self.charge_weight_emb.weight, 0.0, 1.0)
+        nn.init.normal_(self.charge_bias_emb.weight, 0.0, 1.0)
+        
+    def forward(self, atoms: Tensor, charges: Tensor, coord: Tensor) -> Tensor:
+        """
+        Parameters
+        ----------
+        atoms: (long)[B, Na]
+        coord: (float)[B, Na, 3]
+        """
+
+        B, Na = atoms.shape
+        
+        atom_pair_type = (atoms.reshape(B, Na, 1)*self.n_atom_idx+atoms.reshape(B, 1, Na)).reshape(B, Na, Na)
+        charge_pair_type = (charges.reshape(B, Na, 1)*self.n_charge_idx+charges.reshape(B, 1, Na)).reshape(B, Na, Na)
+        dist_weight = self.atom_weight_emb(atom_pair_type)+self.charge_weight_emb(charge_pair_type) # [B, Na, Na, Dpair]
+        dist_bias = self.atom_bias_emb(atom_pair_type)+self.charge_bias_emb(charge_pair_type) # [B, Na, Na, Dpair]
+        dist = get_dist(coord) # [B, Na, Na]
+        pair_g = dist.unsqueeze(-1) * dist_weight + dist_bias
+        stds = self.stds.abs() + 1e-5
+        pair_dist_emb = torch.exp(-0.5*(((pair_g-self.means)/stds)**2)) / ((2*torch.pi)**0.5*stds)
+        pair_emb = self.linear(pair_dist_emb)
+        return pair_emb
+
+class AttnMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int):
+        super().__init__()
+        
+        # graph model
+        self.graph_model = GraphAttnModel()
+        d_model = self.graph_model.d_model
+        H = self.graph_model.H
+
+        # embedding        
+        self.atom_emb = nn.Embedding(n_atom_idx, d_model)
+        self.pair_emb = AtomPairEmbedding(H, n_atom_idx, n_charge_idx)
+        self.charge_emb = nn.Embedding(n_charge_idx, d_model)
+        self.t_emb = nn.Linear(1, d_model)
+        self.trig_coord_emb = TrigCoordEmbedding(d_model)
+        
+        # projection
+        self.node_logit_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_atom_idx)
+        )
+        self.coord_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 3)
+        )
+        self.charge_logit_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, n_charge_idx)
+        )
+
+    def forward(self, datas: list[Mol], ts: list[float]):
+        device = self.device()
+        atoms, coords, charges = zip(*datas)
+        atoms = torch.stack(atoms).to(device) # [B, N]
+        coords = torch.stack(coords).to(device) # [B, N, 3]
+        charges = torch.stack(charges).to(device) # [B, N]
+        ts = torch.tensor(ts, dtype=torch.float32).to(device) # [B, ]
+
+        # Embedding
+        x_node = self.atom_emb(atoms) \
+                + self.charge_emb(charges) \
+                + self.trig_coord_emb(coords) \
+                + self.t_emb(ts.unsqueeze(-1)).unsqueeze(-2) # [B, Na, D]
+        x_pair_0 = self.pair_emb(atoms, charges, coords) # [B, Na(Q), Na(K), Dh]
+        
+        # Main
+        x_node, x_pair_final = self.graph_model(x_node, x_pair_0)
+        
+        # Projection
+        node_logit = self.node_logit_proj(x_node) # [B, Na, Nt]
+        coord_out = self.coord_proj(x_node)
+        charge_logit = self.charge_logit_proj(x_node)
+
+        return node_logit, coord_out, charge_logit
+
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
 
 def get_model(args: Namespace, mdata: MolDataset, path: MolPath):
     if args.model == "egnn":
         return EGNNMolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, args.norm_coors)
     elif args.model == "unimol":
-        pass
+        return AttnMolFMModel(mdata.n_atom_idx, mdata.n_charge_idx)
     else:
         raise ValueError(f"{args.model=}")
 
