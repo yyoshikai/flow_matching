@@ -219,7 +219,10 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
 class _DenoiseCoordCriterion(nn.Module):
     def forward(self, targets: list[Tensor], bpred: Tensor):
         btarget = torch.stack(targets).to(bpred.device)
+        print(f"{btarget[-1][-1][-1]=}", flush=True)
+        print(f"{bpred[-1][-1][-1]=}", flush=True)
         loss = F.mse_loss(bpred, btarget)
+        print(f"{loss=}", flush=True)
         return Loss([loss], ['loss'], [1.0])
 
 class TuplePath(Path):
