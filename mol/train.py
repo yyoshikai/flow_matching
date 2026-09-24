@@ -272,7 +272,7 @@ def get_mol_path(mdata: MolDataset):
         DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
         DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
         DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
-        1e-9
+        0.3
     )
 
 # Model
