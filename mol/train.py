@@ -1,5 +1,6 @@
 import os, yaml
 import itertools as itr
+import multiprocessing as mp
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from collections.abc import Callable, Container
@@ -505,7 +506,7 @@ def main():
     # data2: PathSample
     dataset = PathSampleDataset(dataset, path)
     dataset = ErrorNoneDataset(dataset)
-    data_loader = DataLoader(dataset, batch_size=None, shuffle=True)
+    data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=16)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
     data_iter = itr.filterfalse(lambda x: x is None, data_iter)
     data_iter = itr.batched(data_iter, batch_size)
@@ -535,4 +536,5 @@ def main():
         train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
 
 if __name__ == '__main__':
+    mp.set_start_method('fork')
     main()
