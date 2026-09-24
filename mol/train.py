@@ -480,6 +480,7 @@ def main():
     parser.add_argument("--studyname", required=True)
     parser.add_argument("--norm-coors", action='store_true')
     parser.add_argument("--model", choices=["egnn", "unimol"])
+    parser.add_argument("--num-workers", type=int, default=16)
     args = parser.parse_args()
     batch_size = 64
     lr = 3e-4 * batch_size / 512 # original: batch_size=512, max_lr=3e-4
@@ -506,7 +507,7 @@ def main():
     # data2: PathSample
     dataset = PathSampleDataset(dataset, path)
     dataset = ErrorNoneDataset(dataset)
-    data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=16)
+    data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=args.num_workers)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
     data_iter = itr.filterfalse(lambda x: x is None, data_iter)
     data_iter = itr.batched(data_iter, batch_size)

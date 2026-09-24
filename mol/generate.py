@@ -14,7 +14,7 @@ if __name__ == '__main__':
     parser.add_argument("--step", type=int, default=10000)
     parser.add_argument("--gname", required=True)
     args = parser.parse_args()
-    n_gen = 1
+    n_gen = 7
     batch_size = 128
     T = 100
 
@@ -43,7 +43,7 @@ if __name__ == '__main__':
     for i_step in range(math.ceil(n_gen/batch_size)):
         B = min(batch_size, n_gen-i_step*batch_size)
         datas = [mdata.sample0() for b in range(B)]
-        bprocess = [] # [T, B, P, D]
+        bprocess = [deepcopy(datas)] # [T, B, P, D]
         for t in range(T):
             atom, coord, charge = zip(*datas)
             
@@ -56,6 +56,6 @@ if __name__ == '__main__':
 
         processes += list(zip(*bprocess)) # [B, T, P, D]
     atom, coord, charge = zip(*itr.chain(*processes)) # [P, B*T, D]
-    np.save(f"{gen_dir}/atom.npy", torch.stack(atom).reshape(B, T, n_atom).numpy())
-    np.save(f"{gen_dir}/coord.npy", torch.stack(coord).reshape(B, T, n_atom, 3).numpy())
-    np.save(f"{gen_dir}/charge.npy", torch.stack(charge).reshape(B, T, n_atom).numpy())
+    np.save(f"{gen_dir}/atom.npy", torch.stack(atom).reshape(B, T+1, n_atom).numpy())
+    np.save(f"{gen_dir}/coord.npy", torch.stack(coord).reshape(B, T+1, n_atom, 3).numpy())
+    np.save(f"{gen_dir}/charge.npy", torch.stack(charge).reshape(B, T+1, n_atom).numpy())
