@@ -219,10 +219,7 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
 class _DenoiseCoordCriterion(nn.Module):
     def forward(self, targets: list[Tensor], bpred: Tensor):
         btarget = torch.stack(targets).to(bpred.device)
-        print(f"{btarget[-1][-1][-1]=}", flush=True)
-        print(f"{bpred[-1][-1][-1]=}", flush=True)
         loss = F.mse_loss(bpred, btarget)
-        print(f"{loss=}", flush=True)
         return Loss([loss], ['loss'], [1.0])
 
 class TuplePath(Path):
@@ -430,7 +427,7 @@ class AttnMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
         node_logit = self.node_logit_proj(x_node) # [B, Na, Nt]
         coord_out = self.coord_proj(x_node)
         charge_logit = self.charge_logit_proj(x_node)
-
+        print(f"{coord_out.ravel()[0]=}")
         return node_logit, coord_out, charge_logit
 
     def device(self) -> torch.device:

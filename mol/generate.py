@@ -39,8 +39,6 @@ if __name__ == '__main__':
     model.load_state_dict(torch.load(f"{train_dir}/models/{args.step}.pth", map_location=device))
     model.eval()
 
-    os.makedirs(f"{gen_dir}/ts", exist_ok=True)
-
     processes = [] # [B, T, P, D]
     for i_step in range(math.ceil(n_gen/batch_size)):
         B = min(batch_size, n_gen-i_step*batch_size)
@@ -48,9 +46,6 @@ if __name__ == '__main__':
         bprocess = [] # [T, B, P, D]
         for t in range(T):
             atom, coord, charge = zip(*datas)
-            np.save(f"{gen_dir}/ts/{t}_atom.npy", torch.stack(atom).numpy())
-            np.save(f"{gen_dir}/ts/{t}_coord.npy", torch.stack(coord).numpy())
-            np.save(f"{gen_dir}/ts/{t}_charge.npy", torch.stack(charge).numpy())
             
             t0 = t/T
             t1 = (t+1)/T
