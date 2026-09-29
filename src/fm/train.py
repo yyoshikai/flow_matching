@@ -12,7 +12,7 @@ class Path[D, Tgt, BPred]:
         raise NotImplementedError
     def update(self, datas: list[D], bpred: BPred, t0: float, t1: float) -> list[D]:
         raise NotImplementedError
-    def build_criterion(self) -> Callable[[list[Tgt], BPred], Loss]:
+    def criterion(self, targets: list[Tgt], bpred: BPred) -> Loss:
         raise NotImplementedError
 
 class FMModel[D, BPred](nn.Module):
@@ -55,7 +55,7 @@ def train_fm[D, Tgt, BPred](
     fm_model: FMModel[D], 
     optimizer: Optimizer,
     data_iter: Iterator[tuple[D, float, Tgt]],
-    criterion: nn.Module,
+    path: Path[Tgt, BPred],
     streamer: Streamer,
     stop_criterion: StopCriterion,
 ):
@@ -66,7 +66,7 @@ def train_fm[D, Tgt, BPred](
         datas, ts, targets = zip(*batch_data)
         optimizer.zero_grad()
         bpred = fm_model(datas, ts)
-        loss = criterion(targets, bpred)
+        loss = path.criterion(targets, bpred)
         streamer.put_loss(fm_model, loss)
         loss.loss().backward()
         optimizer.step()

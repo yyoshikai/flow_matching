@@ -121,14 +121,14 @@ class GraphAttnLayer(nn.Module):
         return x, edge
 
 class GraphAttnModel(nn.Module):
-    def __init__(self):
+    def __init__(self, d_model: int, n_layer: int, n_head: int):
         super().__init__()
-        self.d_model = 512
-        self.num_layers = 8
-        self.H = 64
+        self.d_model = d_model
+        self.n_layer = n_layer
+        self.H = n_head
 
         self.layers = nn.ModuleList(
-            GraphAttnLayer(self.d_model, self.H) for _ in range(self.num_layers)
+            GraphAttnLayer(self.d_model, self.H) for _ in range(self.n_layer)
         )
 
     def forward(self, x_node: Tensor, x_pair: Tensor) -> tuple[Tensor, Tensor]:

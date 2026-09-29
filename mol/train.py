@@ -25,6 +25,8 @@ from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreame
 from src.data import ErrorNoneDataset
 from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
+from mol.graph_attn import get_dist, TrigCoordEmbedding, GraphAttnModel
+
 
 # Data
 Mol = tuple[Tensor, Tensor, Tensor]
@@ -189,11 +191,7 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
             prob = F.softmax(bpred[idx][data1_mask], dim=-1)
             data[data1_mask] = torch.multinomial(prob, num_samples=1).squeeze(-1)
         return datas
-    def build_criterion(self):
-        return _DenoiseDiscCriterion()
-
-class _DenoiseDiscCriterion(nn.Module):
-    def forward(self, targets: list[Tensor], bpred: Tensor):
+    def criterion(self, targets: list[Tensor], bpred: Tensor):
         B, N, V = bpred.shape
         btarget = torch.cat(targets).to(bpred.device) # [B*N, ]
         bpred = bpred.reshape(B*N, V)
@@ -214,11 +212,7 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
         k1 = self.kappa(t1)
         datas = [data+(bpred[b]-data)*(k1-k0)/(1-k0) for b, data in enumerate(datas)]
         return datas
-    def build_criterion(self):
-        return _DenoiseCoordCriterion()
-
-class _DenoiseCoordCriterion(nn.Module):
-    def forward(self, targets: list[Tensor], bpred: Tensor):
+    def criterion(self, targets: list[Tensor], bpred: Tensor):
         btarget = torch.stack(targets).to(bpred.device)
         loss = F.mse_loss(bpred, btarget)
         return Loss([loss], ['loss'], [1.0])
@@ -236,24 +230,14 @@ class TuplePath(Path):
         datas = [path.update(datas, bpred0, t0, t1) for path, datas, bpred0
                 in zip(self.paths, p2datas, bpred)] # [P, B]
         return list(zip(*datas)) # [B, P]
-        
-    def build_criterion(self):
-        return _TupleCriterion([path.build_criterion() for path in self.paths], self.names, self.weights)
-
-class _TupleCriterion(nn.Module):
-    def __init__(self, criteria: list[nn.Module], names: list[str], weights: list[float]):
-        super().__init__()
-        self.criteria = criteria
-        self.names = names
-        self.weights = weights
-    def forward(self, targets, bpred):
+    def criterion(self, targets, bpred):
         """
         targets: [n_data, n_path]
         bpred: [n_path]
         
         """
         targets = list(zip(*targets)) # [n_path, n_data]
-        losses = [criterion(ts, bp) for criterion, ts, bp in zip(self.criteria, targets, bpred)]
+        losses = [path.criterion(ts, bp) for path, ts, bp in zip(self.paths, targets, bpred)]
         loss = Loss.cat(losses, self.names, self.weights)
         return loss
 
@@ -262,25 +246,77 @@ class MolPath(TuplePath):
         super().__init__([atom_path, coord_path, charge_path], ["atom", "coord", "charge"], [1, coord_weight, 1])
 
 def cubic_kappa(t: float, a: float, b: float):
-    # 常に k'(t) >= 0 となる条件: 
-    # 概ね -1 <= a <= 2, -1 <= b <= 2 の領域 (より少し大きい)
-    # ... Appendix D. で探索していた範囲
+    """
+    常に k'(t) >= 0 となる条件: 
+        概ね -1 <= a <= 2, -1 <= b <= 2 の領域 (より少し大きい)
+        ... Appendix D. で探索していた範囲
+    """
     return t-t**2*(1-t)*a+t*(1-t)**2*b
 
-def get_mol_path(mdata: MolDataset):
-    return MolPath(
-        DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
-        DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
-        DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
-        0.3
-    )
-
 # Model
-class EGNNMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, norm_coors: bool):
+## Head
+class GraphHead(nn.Module):
+    def __call__(self, x_node_inv: Tensor, x_node_equiv: Tensor|None, x_pair: Tensor|None, coord: Tensor):
+        """
+        Parameters
+        ----------
+        x_node_inv: [B, N, node_inv_size]
+            rotation-invariant, translation-invariant
+        x_node_equiv: [B, N, 3]
+            rotation-equivariant, translation-equivariant
+        x_pair: [B, N, N, pair_size]
+            rotation, translation-invariant
+        coord: [B, N, 3]
+            input coord (rotation, translation-equivariant)
+
+        Notes
+        -----
+        Some of the inputs can be None according to the backbone.
+        Choose proper head dependent on the backbone.
+        """
+        return super().__call__(x_node_inv, x_node_equiv, x_pair, coord)
+
+    def forward(self, x_node_inv: Tensor, x_node_equiv: Tensor|None, x_pair: Tensor|None, coord: Tensor):
+        raise NotImplementedError
+    
+class NodeInvHead(nn.Sequential, GraphHead):
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        return super().forward(x_node_inv)
+
+class RawCoordHead(GraphHead):
+    def __init__(self, centerize: bool):
+        self.centerize = centerize
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        if self.centerize:
+            x_node_equiv = x_node_equiv-torch.mean(x_node_equiv, dim=1, keepdim=True)
+        return x_node_equiv
+
+## Backbone
+class MolBackbone(nn.Module):
+    def __call__(self, atoms: Tensor, coords: Tensor, charges: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+        """
+        Parameters
+        ----------
+        atoms: [B, N]
+        coords: [B, N, 3]
+        charges: [B, N]
+        ts: [B,]
+
+        Returns
+        -------
+        x_node_inv: [B, N, node_inv_size]
+            rotation, translation-invariant feature
+        x_node_equiv: optional, [B, N, 3]
+            rotation, translation-equivariant feature
+        x_pair: optional, [B, N, N, pair_size]
+        """
+        return super().__call__(atoms, coords, charges, ts)
+    def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+        raise NotImplementedError
+
+class EGNNMolBackbone(MolBackbone):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, norm_coors: bool):
         super().__init__()
-        d_model = 512
-        n_layer = 6
 
         # backbone
         self.layers = nn.ModuleList([EGNN(dim=d_model, norm_coors=norm_coors) for _ in range(n_layer)])
@@ -288,41 +324,14 @@ class EGNNMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
-        self.atom_head = nn.Sequential(
-            nn.Linear(d_model, 512), 
-            nn.GELU(), 
-            nn.Linear(512, n_atom_idx)
-        )
-        self.charge_head = nn.Sequential(
-            nn.Linear(d_model, 512), 
-            nn.GELU(), 
-            nn.Linear(512, n_charge_idx)
-        )
 
-    def forward(self, datas, ts):
-        device = self.device()
-        atoms, coords, charges = zip(*datas)
-        atoms = torch.stack(atoms).to(device)
-        coords = torch.stack(coords).to(device) # [B, N, 3]
-        charges = torch.stack(charges).to(device)
-        ts = torch.tensor(ts).to(device) # [B,]
-        coords0 = coords
+    def forward(self, atoms, coords, charges, ts):
         x_node = self.atom_emb(atoms)+self.charge_emb(charges)
         t_emb = self.t_emb(ts.unsqueeze(1)).unsqueeze(1) # [B,] -> [B,1] -> [B, 512] -> [B, 1(N), 512]
         x_node = x_node + t_emb
-        # torch.save(coords, f"coords_0.pt")
         for i, layer in enumerate(self.layers):
             x_node, coords = layer(x_node, coords)
-            # torch.save(coords, f"coords_{i+1}.pt")
-        # raise ValueError
-        coords = coords - torch.mean(coords, dim=1, keepdim=True)
-
-        return self.atom_head(x_node), coords, self.charge_head(x_node)
-
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
-
-from mol.graph_attn import get_dist, TrigCoordEmbedding, GraphAttnModel
+        return x_node, coords, None
 
 class AtomPairEmbedding(nn.Module):
     def __init__(self, d_pair: int, n_atom_idx: int, n_charge_idx: int):
@@ -373,47 +382,20 @@ class AtomPairEmbedding(nn.Module):
         pair_emb = self.linear(pair_dist_emb)
         return pair_emb
 
-class AttnMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int):
+class AttnMolBackbone(MolBackbone):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, n_head: int):
         super().__init__()
         
         # graph model
-        self.graph_model = GraphAttnModel()
-        d_model = self.graph_model.d_model
-        H = self.graph_model.H
+        self.graph_model = GraphAttnModel(d_model, n_layer, n_head)
 
         # embedding        
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
-        self.pair_emb = AtomPairEmbedding(H, n_atom_idx, n_charge_idx)
+        self.pair_emb = AtomPairEmbedding(n_head, n_atom_idx, n_charge_idx)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
         self.trig_coord_emb = TrigCoordEmbedding(d_model)
-        
-        # projection
-        self.node_logit_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, n_atom_idx)
-        )
-        self.coord_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, 3)
-        )
-        self.charge_logit_proj = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, n_charge_idx)
-        )
-
-    def forward(self, datas: list[Mol], ts: list[float]):
-        device = self.device()
-        atoms, coords, charges = zip(*datas)
-        atoms = torch.stack(atoms).to(device) # [B, N]
-        coords = torch.stack(coords).to(device) # [B, N, 3]
-        charges = torch.stack(charges).to(device) # [B, N]
-        ts = torch.tensor(ts, dtype=torch.float32).to(device) # [B, ]
-
+    def forward(self, atoms, coords, charges, ts):
         # Embedding
         x_node = self.atom_emb(atoms) \
                 + self.charge_emb(charges) \
@@ -423,24 +405,26 @@ class AttnMolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
         
         # Main
         x_node, x_pair_final = self.graph_model(x_node, x_pair_0)
-        
-        # Projection
-        node_logit = self.node_logit_proj(x_node) # [B, Na, Nt]
-        coord_out = self.coord_proj(x_node)
-        charge_logit = self.charge_logit_proj(x_node)
-        print(f"{coord_out.ravel()[0]=}")
-        return node_logit, coord_out, charge_logit
+        return x_node, None, x_pair_final-x_pair_0
 
+## FMModel
+class MolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
+    def __init__(self, backbone: MolBackbone, atom_head: GraphHead, coord_head: GraphHead, charge_head: GraphHead):
+        super().__init__()
+        self.backbone = backbone
+        self.heads = nn.ModuleList([atom_head, coord_head, charge_head])
+
+    def forward(self, datas, ts):
+        device = self.device()
+        atoms, coords, charges = zip(*datas)
+        atoms = torch.stack(atoms).to(device)
+        coords = torch.stack(coords).to(device) # [B, N, 3]
+        charges = torch.stack(charges).to(device)
+        ts = torch.tensor(ts).to(device) # [B,]
+        x_node_inv, x_node_equiv, x_pair = self.backbone(atoms, coords, charges, ts)
+        return tuple(head(x_node_inv, x_node_equiv, x_pair, coords) for head in self.heads)
     def device(self) -> torch.device:
         return next(self.parameters()).device
-
-def get_model(args: Namespace, mdata: MolDataset, path: MolPath):
-    if args.model == "egnn":
-        return EGNNMolFMModel(mdata.n_atom_idx, mdata.n_charge_idx, args.norm_coors)
-    elif args.model == "unimol":
-        return AttnMolFMModel(mdata.n_atom_idx, mdata.n_charge_idx)
-    else:
-        raise ValueError(f"{args.model=}")
 
 class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
     def __init__(self, dir_format: str, steps: Container[int], n_sample_per_step: int, mdata: MolDataset):
@@ -473,19 +457,44 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
             }).to_csv(f"{dir}/{idx}.tsv", sep='\t', index=False)
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
+# Training
+def get_mol_path(mdata: MolDataset):
+    return MolPath(
+        DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
+        DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
+        DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
+        0.3
+    )
+
+def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
+    if args.backbone == "egnn":
+        backbone = EGNNMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=6, norm_coors=args.norm_coors)
+        coord_head = RawCoordHead(centerize=True)
+    elif args.backbone == "attn":
+        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64)
+        coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
+    else:
+        raise ValueError(f"{args.backbone=}")
+    atom_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_atom_idx))
+    charge_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_charge_idx))
+    return MolFMModel(backbone, atom_head, coord_head, charge_head)
 
 def main():
     # parameters
     parser = ArgumentParser()
     parser.add_argument("--studyname", required=True)
-    parser.add_argument("--norm-coors", action='store_true')
-    parser.add_argument("--model", choices=["egnn", "unimol"])
     parser.add_argument("--num-workers", type=int, default=16)
+    ## data
+    parser.add_argument("--n-atom", type=int, default=80)
+    parser.add_argument("--init-coord-std", type=float, default=3.0)
+    ## model
+    parser.add_argument("--backbone", choices=["egnn", "attn"])
+    parser.add_argument("--norm-coors", action='store_true')
+    ## training
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--max-step", type=int, default=10000)
+    parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-40
     args = parser.parse_args()
-    batch_size = 64
-    lr = 3e-4 * batch_size / 512 # original: batch_size=512, max_lr=3e-4
-    n_atom = 80
-    init_coord_std = 3.0
 
     # training
     result_dir = f"mol/trains/{args.studyname}"
@@ -495,11 +504,11 @@ def main():
     set_random_seed(0)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     with open(f"{result_dir}/args.yaml", 'w') as f:
-        yaml.dump(vars(args) | dict(batch_size=batch_size, lr=lr, n_atom=n_atom, init_coord_std=init_coord_std), f, sort_keys=False)
+        yaml.dump(vars(args), f, sort_keys=False)
 
     # data_iter
     dataset = UniMolLigandDataset('train', 'rdkit')
-    dataset = mdata = MolDataset(dataset, n_atom, init_coord_std, mask_init=False)
+    dataset = mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=False)
 
     # path
     path = get_mol_path(mdata)
@@ -510,13 +519,12 @@ def main():
     data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=args.num_workers)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
     data_iter = itr.filterfalse(lambda x: x is None, data_iter)
-    data_iter = itr.batched(data_iter, batch_size)
+    data_iter = itr.batched(data_iter, args.batch_size)
 
     # model
     model = get_model(args, mdata, path).to(device)
-    criterion = path.build_criterion()
 
-    optim = torch.optim.Adam(model.parameters(), lr=lr)
+    optim = torch.optim.Adam(model.parameters(), lr=args.item_lr*args.batch_size)
     optimizer = Optimizer(
         optimizer=optim, 
         scheduler=LambdaLR(optim, lambda step: step/5000 if step < 5000 else 1/(step/5000)**0.5), # original: warmup=2500
@@ -533,8 +541,7 @@ def main():
     ])
     stop_criterion = StepStopCriterion(10000)
 
-    with torch.autocast('cuda', dtype=torch.bfloat16):
-        train_fm(model, optimizer, data_iter, criterion, streamer, stop_criterion)
+    train_fm(model, optimizer, data_iter, path, streamer, stop_criterion)
 
 if __name__ == '__main__':
     mp.set_start_method('fork')
