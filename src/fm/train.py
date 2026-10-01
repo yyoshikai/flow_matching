@@ -8,7 +8,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 class Path[D, Tgt, BPred]:
-    def sample(self, data0: D, data1: D, t0: float, t1: float) -> tuple[D, Tgt]:
+    def sample(self, data0: D, data1: D, t: float) -> tuple[D, Tgt]:
         raise NotImplementedError
     def update(self, datas: list[D], bpred: BPred, t0: float, t1: float) -> list[D]:
         raise NotImplementedError
@@ -40,6 +40,8 @@ class Loss:
         return Loss(losses, names, weights)
 
 class Streamer[D, Tgt]:
+    def start(self, model: nn.Module):
+        pass
     def put_data(self, batch: list[tuple[D, float, Tgt]]):
         pass
     def put_loss(self, model: nn.Module, loss: Loss) -> None:
@@ -60,6 +62,7 @@ def train_fm[D, Tgt, BPred](
     stop_criterion: StopCriterion,
 ):
     fm_model.train()
+    streamer.start(fm_model)
     while True:
         batch_data = data_iter.__next__()
         streamer.put_data(batch_data)
@@ -73,13 +76,6 @@ def train_fm[D, Tgt, BPred](
         streamer.put_optim(fm_model, optimizer)
         if stop_criterion(fm_model, batch_data, loss):
             break
-
-class Distribution[D]:
-    def sample(self) -> D:
-        raise NotImplementedError
-
-    def bsample(self, n: int) -> list[D]:
-        return [self.sample() for i in range(n)]
 
 class GStreamer[D, BPred]:
     def init(self, data: D, batch_idx: int):

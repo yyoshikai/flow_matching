@@ -19,7 +19,7 @@ def get_dist(coord: Tensor):
     dist2 = r2.unsqueeze(-1) + r2.unsqueeze(-2) - corr*2
     return torch.sqrt(torch.abs(dist2))
 
-class TrigCoordEmbedding(nn.Module):
+class AbsCoordEmbedding(nn.Module):
     """
     Embed coord directly with sinusoidal embedding
     ( = remove 3d-equivariance)
@@ -119,40 +119,6 @@ class GraphAttnLayer(nn.Module):
         x = x + self.ff(x)
 
         return x, edge
-
-class GraphAttnModel(nn.Module):
-    def __init__(self, d_model: int, n_layer: int, n_head: int):
-        super().__init__()
-        self.d_model = d_model
-        self.n_layer = n_layer
-        self.H = n_head
-
-        self.layers = nn.ModuleList(
-            GraphAttnLayer(self.d_model, self.H) for _ in range(self.n_layer)
-        )
-
-    def forward(self, x_node: Tensor, x_pair: Tensor) -> tuple[Tensor, Tensor]:
-        """
-        Parameters
-        ----------
-        x_node: [B, Na, D]
-        x_pair: [B, Na, Na, Dh]
-
-        Returns
-        -------
-        x_node: [B, Na, D]
-        x_pair: [B, Na, Na, Dh]
-        
-        """
-        B, Na, _ = x_node.shape
-
-        x_node_shaped = x_node.permute(1, 0, 2)
-        x_pair_shaped = x_pair.permute(0, 3, 1, 2).reshape(B*self.H, Na, Na) # [B*Dh, Q, K]
-        for i, layer in enumerate(self.layers):
-            x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
-        x_pair = x_pair_shaped.reshape(B, self.H, Na, Na).permute(0, 2, 3, 1)
-        x_node = x_node_shaped.permute(1, 0, 2)
-        return x_node, x_pair
 
 class DiffCoordHead(nn.Module):
     def __init__(self, D):

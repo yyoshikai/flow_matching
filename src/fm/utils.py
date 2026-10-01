@@ -57,6 +57,9 @@ class AmpContainer(Container[int]):
 class Streamers(list[Streamer], Streamer):
     def __init__(self, streamers: list[Streamer]):
         super().__init__(streamers)
+    def start(self, model):
+        for streamer in self:
+            streamer.start(model)
     def put_data(self, batch):
         for streamer in self:
             streamer.put_data(batch)
@@ -72,12 +75,17 @@ class SaveModelStreamer(Streamer):
         self.path_format = path_format
         self.steps = steps
         self.step = 0
+    def start(self, model):
+        if self.step in self.steps:
+            self.save(model)
     def put_optim(self, model, optimizer):
         self.step += 1
         if self.step in self.steps:
-            path = self.path_format.format(step=self.step)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            torch.save(model.state_dict(), path)
+            self.save(model)
+    def save(self, model: nn.Module):
+        path = self.path_format.format(step=self.step)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save(model.state_dict(), path)
 
 class LogStepStreamer(Streamer):
     def __init__(self, logger: Logger, steps: Container):

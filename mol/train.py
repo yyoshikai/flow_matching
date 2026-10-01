@@ -25,8 +25,7 @@ from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreame
 from src.data import ErrorNoneDataset
 from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
-from mol.graph_attn import get_dist, TrigCoordEmbedding, GraphAttnModel
-
+from mol.graph_attn import get_dist, AbsCoordEmbedding, GraphAttnLayer
 
 # Data
 Mol = tuple[Tensor, Tensor, Tensor]
@@ -147,17 +146,17 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
         return atom0, coord0, charge0
 
 class PathSampleDataset[D, Tgt, BPred](Dataset):
-    def __init__(self, dataset: Dataset[tuple[D, D]], path: Path[D, Tgt, BPred]):
+    def __init__(self, dataset: Dataset[tuple[D, D]], path: Path[D, Tgt, BPred], ts: list[float]):
         self.dataset = dataset
         self.path = path
-        self.N = 100
-
+        self.ts = ts
+        assert (self.ts[0], self.ts[-1]) == (0.0, 1.0)
 
     def __getitem__(self, idx):
         data0, data1 = self.dataset[idx]
-        t = np.random.randint(0, self.N)
-        data, tgt = self.path.sample(data0, data1, t/self.N, (t+1)/self.N)
-        return data, t/self.N, tgt
+        t = np.random.choice(self.ts[:-1])
+        data, tgt = self.path.sample(data0, data1, t)
+        return data, t, tgt
 
     def __len__(self):
         return len(self.dataset)
@@ -174,8 +173,8 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
     def __init__(self, n_atom_idx: int, kappa: Callable[[float], float]):
         self.n_atom_idx = n_atom_idx
         self.kappa = kappa
-    def sample(self, data0, data1, t0, t1):
-        k = self.kappa(t0)
+    def sample(self, data0, data1, t):
+        k = self.kappa(t)
         # data
         data = data0.clone().detach()
         is_data1 = torch.rand_like(data, dtype=torch.float) < k
@@ -202,8 +201,8 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
     def __init__(self, kappa: Callable[[float], float]):
         self.kappa = kappa
 
-    def sample(self, data0, data1, t0, t1):
-        k = self.kappa(t0)
+    def sample(self, data0, data1, t):
+        k = self.kappa(t)
         data = data0*(1-k)+data1*k
         return data, data1
     def update(self, datas, bpred, t0, t1):
@@ -217,13 +216,36 @@ class DenoiseCoordPath(Path[Tensor, Tensor, Tensor]):
         loss = F.mse_loss(bpred, btarget)
         return Loss([loss], ['loss'], [1.0])
 
+class VectorCoordPath(Path[Tensor, Tensor, Tensor]):
+    def __init__(self, kappa: Callable[[float], float], dt: float):
+        self.kappa = kappa
+        self.dt = dt
+    def sample(self, data0, data1, t):
+        k = self.kappa(t)
+        k1 = self.kappa(t+self.dt)
+        data = data0*(1-k)+data1*k
+        vec = (data1-data0)*(k1-k)
+        return data, vec
+    def update(self, datas, bpred, t0, t1):
+        bpred = bpred.to(datas[0].device)
+        k0 = self.kappa(t0)
+        k1 = self.kappa(t1)
+        k0_dt = self.kappa(t0+self.dt)
+        datas = [data+bpred[b]*(k1-k0)/(k0_dt-k0) for b, data in enumerate(datas)]
+        return datas
+    def criterion(self, targets, bpred):
+        btarget = torch.stack(targets).to(bpred.device)
+        loss = F.mse_loss(bpred, btarget)
+        return Loss([loss], ['loss'], [1.0])
+
+
 class TuplePath(Path):
     def __init__(self, paths: list[Path], names: list[str], weights: list[float]):
         self.paths = paths
         self.names = names
         self.weights = weights
-    def sample(self, data0, data1, t0, t1):
-        outs = [path.sample(d0, d1, t0, t1) for path, d0, d1 in zip(self.paths, data0, data1)]
+    def sample(self, data0, data1, t):
+        outs = [path.sample(d0, d1, t) for path, d0, d1 in zip(self.paths, data0, data1)]
         return tuple(zip(*outs))
     def update(self, datas, bpred, t0, t1):
         p2datas = list(zip(*datas))
@@ -284,12 +306,29 @@ class NodeInvHead(nn.Sequential, GraphHead):
         return super().forward(x_node_inv)
 
 class RawCoordHead(GraphHead):
-    def __init__(self, centerize: bool):
+    def __init__(self, centerize: bool, t_inv: bool):
+        super().__init__()
         self.centerize = centerize
     def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
         if self.centerize:
             x_node_equiv = x_node_equiv-torch.mean(x_node_equiv, dim=1, keepdim=True)
         return x_node_equiv
+
+class EquivCoordHead(nn.Sequential, GraphHead):
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        B, N, _ = coord.shape
+        pair_coef = super().forward(x_pair) # [B, N, N, 1]
+        coord_diff = coord.reshape(B, N, 1, 3) - coord.reshape(B, 1, N, 3) # [B, Na, Na, 3]
+        coord_vecs = torch.sum(coord_diff * pair_coef, dim=2) / N # [B, Na, 3]
+        return coord+coord_vecs
+
+class TInvCoordHead(GraphHead):
+    def __init__(self, equiv_coord_head: GraphHead):
+        super().__init__()
+        self.head = equiv_coord_head
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        equiv_coord = self.head(x_node_inv, x_node_equiv, x_pair, coord)
+        return equiv_coord - coord
 
 ## Backbone
 class MolBackbone(nn.Module):
@@ -314,6 +353,7 @@ class MolBackbone(nn.Module):
     def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
         raise NotImplementedError
 
+### EGNN
 class EGNNMolBackbone(MolBackbone):
     def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, norm_coors: bool):
         super().__init__()
@@ -333,6 +373,7 @@ class EGNNMolBackbone(MolBackbone):
             x_node, coords = layer(x_node, coords)
         return x_node, coords, None
 
+## Attention
 class AtomPairEmbedding(nn.Module):
     def __init__(self, d_pair: int, n_atom_idx: int, n_charge_idx: int):
         super().__init__()
@@ -371,8 +412,8 @@ class AtomPairEmbedding(nn.Module):
 
         B, Na = atoms.shape
         
-        atom_pair_type = (atoms.reshape(B, Na, 1)*self.n_atom_idx+atoms.reshape(B, 1, Na)).reshape(B, Na, Na)
-        charge_pair_type = (charges.reshape(B, Na, 1)*self.n_charge_idx+charges.reshape(B, 1, Na)).reshape(B, Na, Na)
+        atom_pair_type = (atoms.reshape(B, Na, 1)*self.n_atom_idx+atoms.reshape(B, 1, Na))
+        charge_pair_type = (charges.reshape(B, Na, 1)*self.n_charge_idx+charges.reshape(B, 1, Na))
         dist_weight = self.atom_weight_emb(atom_pair_type)+self.charge_weight_emb(charge_pair_type) # [B, Na, Na, Dpair]
         dist_bias = self.atom_bias_emb(atom_pair_type)+self.charge_bias_emb(charge_pair_type) # [B, Na, Na, Dpair]
         dist = get_dist(coord) # [B, Na, Na]
@@ -383,28 +424,39 @@ class AtomPairEmbedding(nn.Module):
         return pair_emb
 
 class AttnMolBackbone(MolBackbone):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, n_head: int):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, n_head: int, abs_coord_emb: bool):
         super().__init__()
+        self.n_head = n_head
         
-        # graph model
-        self.graph_model = GraphAttnModel(d_model, n_layer, n_head)
-
         # embedding        
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
         self.pair_emb = AtomPairEmbedding(n_head, n_atom_idx, n_charge_idx)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
-        self.trig_coord_emb = TrigCoordEmbedding(d_model)
+        self.abs_coord_emb = AbsCoordEmbedding(d_model) if abs_coord_emb else lambda x: 0
+
+        # layers
+        self.layers = nn.ModuleList(GraphAttnLayer(d_model, n_head) 
+                for _ in range(n_layer))
+
+
     def forward(self, atoms, coords, charges, ts):
         # Embedding
         x_node = self.atom_emb(atoms) \
                 + self.charge_emb(charges) \
-                + self.trig_coord_emb(coords) \
+                + self.abs_coord_emb(coords) \
                 + self.t_emb(ts.unsqueeze(-1)).unsqueeze(-2) # [B, Na, D]
-        x_pair_0 = self.pair_emb(atoms, charges, coords) # [B, Na(Q), Na(K), Dh]
-        
+        x_pair = x_pair_0 = self.pair_emb(atoms, charges, coords) # [B, Na(Q), Na(K), Dh]
+
         # Main
-        x_node, x_pair_final = self.graph_model(x_node, x_pair_0)
+        B, N, _ = x_node.shape
+        x_node_shaped = x_node.permute(1, 0, 2)
+        x_pair_shaped = x_pair.permute(0, 3, 1, 2).reshape(B*self.n_head, N, N) # [B*Dh, Q, K]
+        for i, layer in enumerate(self.layers):
+            x_node_shaped, x_pair_shaped = layer(x_node_shaped, x_pair_shaped)
+        x_pair_final = x_pair_shaped.reshape(B, self.n_head, N, N).permute(0, 2, 3, 1)
+        x_node = x_node_shaped.permute(1, 0, 2)
+
         return x_node, None, x_pair_final-x_pair_0
 
 ## FMModel
@@ -420,7 +472,7 @@ class MolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
         atoms = torch.stack(atoms).to(device)
         coords = torch.stack(coords).to(device) # [B, N, 3]
         charges = torch.stack(charges).to(device)
-        ts = torch.tensor(ts).to(device) # [B,]
+        ts = torch.tensor(ts, dtype=torch.float).to(device) # [B,] dtype is necessary
         x_node_inv, x_node_equiv, x_pair = self.backbone(atoms, coords, charges, ts)
         return tuple(head(x_node_inv, x_node_equiv, x_pair, coords) for head in self.heads)
     def device(self) -> torch.device:
@@ -458,10 +510,42 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
 # Training
-def get_mol_path(mdata: MolDataset):
+def get_ts(args: Namespace) -> list[float]:
+    if args.t_scheduler == 'linear':
+        return np.linspace(0, 1, args.t_n+1).tolist()
+    elif args.t_scheduler == 'last_pow':
+        """
+        Parameters: a, b
+        t(s) = 
+            c*s when 0≦s≦b
+            1-d*(1-s)^a when b≦s≦1
+        c and d is determined so that t(s) is smooth.
+        """
+        a = args.t_a if args.t_a is not None else 2
+        b = args.t_b if args.t_b is not None else 0.8
+        c = a/(1-b+a*b)
+        d = 1/(1-b)**(a-1)/(1-b+a*b)
+        return [s*c if s <= b else 1-d*(1-s)**a 
+                for s in np.linspace(0, 1, args.t_n+1).tolist()]
+    else:
+        raise ValueError(f"{args.t_scheduler=}")
+
+def get_mol_path(mdata: MolDataset, args: Namespace):
+    ## coord_path
+    if not hasattr(args, 'coord_path'): # temporary
+        args.coord_path = 'denoise'
+    coord_kappa = partial(cubic_kappa, a=0, b=0)
+    if args.coord_path == 'denoise':
+        coord_path = DenoiseCoordPath(coord_kappa)
+    elif args.coord_path == 'vector':
+        assert args.t_scheduler == 'linear'
+        coord_path = VectorCoordPath(coord_kappa, 1/args.t_n)
+    else:
+        raise ValueError
+
     return MolPath(
         DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
-        DenoiseCoordPath(partial(cubic_kappa, a=0, b=0)),
+        coord_path,
         DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
         0.3
     )
@@ -471,10 +555,15 @@ def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
         backbone = EGNNMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=6, norm_coors=args.norm_coors)
         coord_head = RawCoordHead(centerize=True)
     elif args.backbone == "attn":
-        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64)
-        coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
+        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord_emb)
+        if args.abs_coord_head:
+            coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
+        else:
+            coord_head = EquivCoordHead(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 3))
     else:
         raise ValueError(f"{args.backbone=}")
+    if args.coord_path == 'vector' and not isinstance(coord_head, NodeInvHead):
+        coord_head = TInvCoordHead(coord_head)
     atom_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_atom_idx))
     charge_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_charge_idx))
     return MolFMModel(backbone, atom_head, coord_head, charge_head)
@@ -487,18 +576,27 @@ def main():
     ## data
     parser.add_argument("--n-atom", type=int, default=80)
     parser.add_argument("--init-coord-std", type=float, default=3.0)
+    parser.add_argument("--t-n", type=int, default=100)
+    parser.add_argument("--t-scheduler", choices=['linear', 'last_pow'], default='linear')
+    parser.add_argument("--t-a", type=float)
+    parser.add_argument("--t-b", type=float)
+    parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     ## model
-    parser.add_argument("--backbone", choices=["egnn", "attn"])
+    parser.add_argument("--backbone", choices=['egnn', 'attn'])
     parser.add_argument("--norm-coors", action='store_true')
+    ### attn
+    parser.add_argument("--abs-coord-emb", action='store_true')
+    parser.add_argument("--abs-coord-head", action='store_true')
     ## training
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-step", type=int, default=10000)
-    parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-40
+    parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-4
     args = parser.parse_args()
 
     # training
     result_dir = f"mol/trains/{args.studyname}"
-    cleardir(result_dir)
+    if os.path.exists(result_dir):
+        raise ValueError(f"{result_dir=} already exists.")
     logger = get_logger(stream=True)
     add_file_handler(logger, f"{result_dir}/debug.log")
     set_random_seed(0)
@@ -511,10 +609,10 @@ def main():
     dataset = mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=False)
 
     # path
-    path = get_mol_path(mdata)
+    path = get_mol_path(mdata, args)
 
     # data2: PathSample
-    dataset = PathSampleDataset(dataset, path)
+    dataset = PathSampleDataset(dataset, path, get_ts(args))
     dataset = ErrorNoneDataset(dataset)
     data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=args.num_workers)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
@@ -534,12 +632,12 @@ def main():
     # other
     streamer = Streamers([
         LogStepStreamer(logger, AmpContainer(1, 10000)), 
-        SaveModelStreamer(result_dir+"/models/{step}.pth", RepeatContainer(10000)),
+        SaveModelStreamer(result_dir+"/models/{step}.pth", RepeatContainer(0, 10000)),
         SaveLossStreamer(result_dir+"/loss.csv"),
         SaveGradStreamer(result_dir+"/grads/{step}/{k}.pth", CatContainer([1], AmpContainer(100, 10000))),
         SaveBatchStreamer(result_dir+"/sample_data/{step}",range(10), 3, mdata)
     ])
-    stop_criterion = StepStopCriterion(10000)
+    stop_criterion = StepStopCriterion(args.max_step)
 
     train_fm(model, optimizer, data_iter, path, streamer, stop_criterion)
 

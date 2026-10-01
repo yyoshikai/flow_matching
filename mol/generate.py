@@ -4,7 +4,7 @@ from argparse import ArgumentParser, Namespace
 from copy import deepcopy
 import numpy as np
 import torch
-from .train import get_mol_path, MolDataset, get_model
+from .train import MolDataset, get_mol_path, get_model, get_ts
 from src.data.datasets.unimol import UniMolLigandDataset
 
 if __name__ == '__main__':
@@ -33,6 +33,7 @@ if __name__ == '__main__':
     mdata = MolDataset(dataset, n_atom, init_coord_std, mask_init=False)
     path = get_mol_path(mdata)
     atom_path, coord_path, charge_path = path.paths
+    ts = get_ts(targs)
 
     # model
     model = get_model(targs, mdata, path).to(device)
@@ -44,11 +45,11 @@ if __name__ == '__main__':
         B = min(batch_size, n_gen-i_step*batch_size)
         datas = [mdata.sample0() for b in range(B)]
         bprocess = [deepcopy(datas)] # [T, B, P, D]
-        for t in range(T):
-            atom, coord, charge = zip(*datas)
+        for s in range(len(ts)-1):
             
-            t0 = t/T
-            t1 = (t+1)/T
+            t0 = ts[s]
+            t1 = ts[s+1]
+            print(f"{s=}, {t0=}, {t1=}")
             with torch.inference_mode():
                 bpred = model(datas, [t0]*B)
             datas = path.update(datas, bpred, t0, t1) # [B, P, D]
