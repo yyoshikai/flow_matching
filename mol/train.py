@@ -582,7 +582,7 @@ def main():
     parser.add_argument("--t-b", type=float)
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     ## model
-    parser.add_argument("--backbone", choices=['egnn', 'attn'])
+    parser.add_argument("--backbone", choices=['egnn', 'attn'], default='attn')
     parser.add_argument("--norm-coors", action='store_true')
     ### attn
     parser.add_argument("--abs-coord-emb", action='store_true')
