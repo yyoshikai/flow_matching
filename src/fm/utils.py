@@ -42,7 +42,7 @@ class AmpContainer(Container[int]):
         self.min_step = min_step
         self.max_step = max_step
     def __contains__(self, x):
-        if x >= self.max_step:
+        if self.max_step is not None and x >= self.max_step:
             return x % self.max_step == 0
         else:
             if x % self.min_step != 0:

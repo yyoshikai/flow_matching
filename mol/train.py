@@ -1,9 +1,10 @@
-import os, yaml
+import os, yaml, re
 import itertools as itr
 import multiprocessing as mp
 from argparse import ArgumentParser, Namespace
 from functools import partial
 from collections.abc import Callable, Container
+from collections import defaultdict
 from logging import getLogger
 from pathlib import Path as _Path
 import numpy as np, pandas as pd
@@ -11,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, get_worker_info
 from torch.optim.lr_scheduler import LambdaLR
 from rdkit import Chem
 from scipy.spatial.transform import Rotation as R
@@ -22,13 +23,12 @@ from src.utils.random import set_random_seed
 from src.utils.path import cleardir
 from src.fm.train import train_fm, Path, FMModel, Loss, Streamer
 from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreamer, SaveLossStreamer, SaveGradStreamer, AmpContainer, RepeatContainer, CatContainer, StepStopCriterion
-from src.data import ErrorNoneDataset
 from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
 from mol.graph_attn import get_dist, AbsCoordEmbedding, GraphAttnLayer
 
 # Data
-Mol = tuple[Tensor, Tensor, Tensor]
+Mol = tuple[Tensor, Tensor, Tensor] # atoms, coords, charges
 
 with open(_Path(__file__).parent / "atoms.txt") as f:
     ATOMS = f.read().splitlines()
@@ -87,13 +87,14 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
 
         # data1 coord
         ## centerize & random rotation
-        mol_coord = mol.GetConformer().GetPositions()[:n_mol_atom]
-        mol_coord = mol_coord - np.mean(mol_coord, axis=0)
-        mol_coord = np.matmul(mol_coord, get_random_rotation_matrix(self.rng))
+        coord1 = mol.GetConformer().GetPositions()[:n_mol_atom]
+        coord1 = coord1 - np.mean(coord1, axis=0)
+        coord1 = np.matmul(coord1, get_random_rotation_matrix(self.rng))
         ## add padding
-        mol_pad_coord = self.rng.normal(size=(n_pad_atom,3))*self.init_coord_std
-        mol_pad_coord -= np.mean(mol_pad_coord, axis=0)
-        coord1 = np.concatenate([mol_coord, mol_pad_coord])
+        if n_pad_atom > 0:
+            mol_pad_coord = self.rng.normal(size=(n_pad_atom,3))*self.init_coord_std
+            mol_pad_coord -= np.mean(mol_pad_coord, axis=0)
+            coord1 = np.concatenate([coord1, mol_pad_coord])
 
         # data1 charge
         charge1 = torch.tensor([mol.GetAtomWithIdx(i).GetFormalCharge() for i in range(n_mol_atom)]+[0]*n_pad_atom, dtype=torch.long)
@@ -160,6 +161,45 @@ class PathSampleDataset[D, Tgt, BPred](Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+ERROR_FORMATS = {
+    'large_mol': (ValueError, re.compile(r"n_mol_atom=(\d+) > self\.n_atom=(\d+)")), 
+    'no_sn': (KeyError, re.compile(r"Sn")),
+}
+class ErrorNoneDataset(Dataset):
+    logger = getLogger(f"{__module__}.{__qualname__}")
+
+    def __init__(self, dataset: Dataset):
+        self.dataset = dataset
+        self.error_count = defaultdict(int)
+        self.n = 0
+        self.log_ns = AmpContainer(1000)
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, idx: int):
+        if idx < 0 or len(self) <= idx:
+            raise IndexError
+        try:
+            item = self.dataset[idx]
+        except RuntimeWarning as e:
+            raise e
+        except Exception as e:
+            for ename, (ecls, earg) in ERROR_FORMATS.items():
+                if isinstance(e, ecls) and re.fullmatch(earg, e.args[0]):
+                    self.error_count[ename] += 1
+                    break
+            else:
+                self.logger.info(f"Unknown error at {type(self.dataset).__name__}[{idx}]: {type(e).__name__}{e.args}")
+            item = None
+
+        self.n += 1
+        if self.n in self.log_ns:
+            worker_info = get_worker_info()
+            self.logger.debug(f"Error in {self.n} __getitem__:")
+            for ename, ecount in sorted(self.error_count.items(), key=lambda x: -x[1]):
+                self.logger.debug(f"    {ename}: {ecount}")
+
+        return item
 
 # Path
 class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
@@ -237,7 +277,6 @@ class VectorCoordPath(Path[Tensor, Tensor, Tensor]):
         btarget = torch.stack(targets).to(bpred.device)
         loss = F.mse_loss(bpred, btarget)
         return Loss([loss], ['loss'], [1.0])
-
 
 class TuplePath(Path):
     def __init__(self, paths: list[Path], names: list[str], weights: list[float]):
@@ -532,8 +571,8 @@ def get_ts(args: Namespace) -> list[float]:
 
 def get_mol_path(mdata: MolDataset, args: Namespace):
     ## coord_path
-    if not hasattr(args, 'coord_path'): # temporary
-        args.coord_path = 'denoise'
+    # if not hasattr(args, 'coord_path'): # temporary
+    #     args.coord_path = 'denoise'
     coord_kappa = partial(cubic_kappa, a=0, b=0)
     if args.coord_path == 'denoise':
         coord_path = DenoiseCoordPath(coord_kappa)
@@ -542,13 +581,14 @@ def get_mol_path(mdata: MolDataset, args: Namespace):
         coord_path = VectorCoordPath(coord_kappa, 1/args.t_n)
     else:
         raise ValueError
+    if getattr(args, 'disc_scheduler', 'sq') == 'sq':
+        atom_path = DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1))
+        charge_path = DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1))
+    else:
+        atom_path = DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=0, b=0))
+        charge_path = DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=0, b=0))
 
-    return MolPath(
-        DenoiseDiscPath(mdata.n_atom_idx, partial(cubic_kappa, a=1, b=-1)),
-        coord_path,
-        DenoiseDiscPath(mdata.n_charge_idx, partial(cubic_kappa, a=1, b=-1)), 
-        0.3
-    )
+    return MolPath(atom_path, coord_path, charge_path, 0.3)
 
 def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
     if args.backbone == "egnn":
@@ -580,9 +620,11 @@ def main():
     parser.add_argument("--t-scheduler", choices=['linear', 'last_pow'], default='linear')
     parser.add_argument("--t-a", type=float)
     parser.add_argument("--t-b", type=float)
+    parser.add_argument("--disc-scheduler", choices=['linear', 'sq'], default='sq')
+    parser.add_argument("--mask-init", action='store_true')
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     ## model
-    parser.add_argument("--backbone", choices=['egnn', 'attn'])
+    parser.add_argument("--backbone", choices=['egnn', 'attn'], default='attn')
     parser.add_argument("--norm-coors", action='store_true')
     ### attn
     parser.add_argument("--abs-coord-emb", action='store_true')
@@ -600,13 +642,13 @@ def main():
     logger = get_logger(stream=True)
     add_file_handler(logger, f"{result_dir}/debug.log")
     set_random_seed(0)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda')
     with open(f"{result_dir}/args.yaml", 'w') as f:
         yaml.dump(vars(args), f, sort_keys=False)
 
     # data_iter
     dataset = UniMolLigandDataset('train', 'rdkit')
-    dataset = mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=False)
+    dataset = mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init)
 
     # path
     path = get_mol_path(mdata, args)
@@ -641,6 +683,10 @@ def main():
 
     train_fm(model, optimizer, data_iter, path, streamer, stop_criterion)
 
+import warnings
+
 if __name__ == '__main__':
     mp.set_start_method('fork')
+    warnings.simplefilter('error')
+    warnings.filterwarnings('ignore', 'numpy.core.numeric is deprecated and has been renamed to numpy._core.numeric. The numpy._core namespace contains private NumPy internals and its use is discouraged, as NumPy internals can change without warning in any release. In practice, most real-world usage of numpy.core is to access functionality in the public NumPy API. If that is the case, use the public NumPy API. If not, you are using NumPy internals. If you would still like to access an internal attribute, use numpy._core.numeric._frombuffer.', DeprecationWarning)
     main()
