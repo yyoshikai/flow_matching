@@ -81,3 +81,5 @@ if __name__ == '__main__':
             continue
         with open(f"{gen_dir}/mols/{b}.sdf", 'w') as f:
             f.write(Chem.MolToMolBlock(mol))
+
+    

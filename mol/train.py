@@ -23,7 +23,6 @@ from src.utils.logger import get_logger, add_file_handler
 from src.utils.random import set_random_seed
 from src.fm.train import train_fm, Path, FMModel, Loss, Streamer
 from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreamer, SaveLossStreamer, SaveGradStreamer, AmpContainer, RepeatContainer, CatContainer, StepStopCriterion
-from src.data.coord import get_random_rotation_matrix
 from src.data.datasets.unimol import UniMolLigandDataset
 from mol.graph_attn import get_dist, AbsCoordEmbedding, GraphAttnLayer
 
@@ -34,7 +33,44 @@ with open(_Path(__file__).parent / "atoms.txt") as f:
     ATOMS = f.read().splitlines()
 MAX_ABS_CHARGE = 4
 
-class MolDataset(Dataset[tuple[Mol, Mol]|None]):
+def get_random_rotation_matrix(rng: np.random.Generator) -> Tensor:
+    # get axes
+    axes = []
+    while(len(axes) < 2):
+        new_axis = rng.random(3)*2-1.0
+        
+        new_norm = np.sqrt(np.sum(new_axis**2))
+        if (new_norm < 0.1 or 1 <= new_norm): continue
+        new_axis = new_axis / new_norm
+        if np.any([np.abs(np.sum(axis*new_axis)) >= 0.9 for axis in axes]):
+            continue
+        axes.append(new_axis)
+
+    # get rotation matrix
+    axis0, axis1b = axes
+    axis1 = np.cross(axis0, axis1b)
+    axis1 = axis1 / np.linalg.norm(axis1)
+    axis2 = np.cross(axis0, axis1)
+    axis2 = axis2 / np.linalg.norm(axis2)
+    return torch.tensor(np.array([axis0, axis1, axis2]), dtype=torch.float)
+
+def _permute_rotate_ot(coord0: Tensor, coord1: Tensor):
+    coord0 = coord0.numpy()
+    coord1 = coord1.numpy()
+    dist = np.sqrt(np.abs((coord1**2).sum(axis=1)[:, np.newaxis]+(coord0**2).sum(axis=1)[np.newaxis,:] - np.matmul(coord1, coord0.T)*2)) # [N1, N0]
+    _, col_ind = linear_sum_assignment(dist)
+    coord0 = coord0[col_ind]
+    rotation, _ = R.align_vectors(coord1, coord0)
+    coord0 = rotation.apply(coord0)
+    coord0 = torch.tensor(coord0, dtype=torch.float)    
+    return coord0
+
+def extend_tensor(x: Tensor, fill_value: int|float, n: int, dim: int=0):
+    shape = list(x.shape)
+    shape[dim] = n-shape[dim]
+    return torch.cat([x, torch.full(shape, fill_value, dtype=x.dtype)], dim=dim)
+
+class MolDataset(Dataset[tuple[Mol, Mol]]):
     logger = getLogger(f"{__module__}.{__qualname__}")
     def __init__(self, mol_data: Dataset[Chem.Mol], n_atom: int, init_coord_std: float, mask_init: bool, padding: Literal['pad_random_ot', 'pad_ot_same', 'pad_ignore', 'ignore']):
         """
@@ -46,10 +82,10 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
             If True, all atoms of data0 is MASK.
             If False, all atoms are randomly initialized.
         padding: 
-            'pad_random_ot': Add random coord to data0 and data1 -> OT in all atoms
+            'pad_random_ot': Add random coord to data0 and data1 -> OT in all atoms (former default)
             'pad_ot_same': OT in molecule -> same random coord to data0 and data1
             'pad_ignore': OT in molecule -> same random coord to data0 and data1, ignore at loss
-            'ignore': No padding atom, ignore padded area in model and loss.
+            'ignore': No padding atom, ignore padded area at both model and loss.
 
         """
         ## constructor parameters
@@ -70,6 +106,12 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
 
         self.n_charge_idx = MAX_ABS_CHARGE*2+1
 
+    def _random_coord(self, n: int, centerize: bool) -> Tensor:
+        x = torch.randn((n, 3), dtype=torch.float)*self.init_coord_std
+        if centerize:
+            x -= torch.mean(x, dim=0)
+        return x
+
     def __getitem__(self, idx: int):
 
         # get raw mol
@@ -83,55 +125,43 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
         n_pad_atom = self.n_atom - n_mol_atom
 
         # data1
-        atom1 = [self.atom2idx[mol.GetAtomWithIdx(i).GetSymbol()] for i in range(n_mol_atom)]
-        coord1 = mol.GetConformer().GetPositions()
-        coord1 = coord1 - np.mean(coord1, axis=0)
-        coord1 = np.matmul(coord1, get_random_rotation_matrix(self.rng))
-        charge1 = [mol.GetAtomWithIdx(i).GetFormalCharge() for i in range(n_mol_atom)]
-
-        # pad data1 before OT
-        if n_pad_atom > 0 and self.padding == 'pad_random_ot':
-            atom1 = atom1+[self.atom2idx['PAD']]*n_pad_atom
-            pad_coord1 = self.rng.normal(size=(n_pad_atom,3))*self.init_coord_std
-            pad_coord1 -= np.mean(pad_coord1, axis=0)
-            coord1 = np.concatenate([coord1, pad_coord1])
-            charge1 = charge1+[0]*n_pad_atom
-
-        # data0
-        atom0, coord0, charge0 = self.sample0(len(atom1))
-        coord0 = coord0.numpy()
-
-        # OT
-        ## permutation
-        dist = np.sqrt((coord1**2).sum(axis=1)[:, np.newaxis]+(coord0**2).sum(axis=1)[np.newaxis,:] - np.matmul(coord1, coord0.T)*2) # [N1, N0]
-        _, col_ind = linear_sum_assignment(dist)
-        atom0 = atom0[col_ind]
-        coord0 = coord0[col_ind]
-        charge0 = charge0[col_ind]
-        ## rotation
-        rotation, _ = R.align_vectors(coord1, coord0)
-        coord0 = rotation.apply(coord0)
-
-        # padding after OT
-        if n_pad_atom > 0 and self.padding in ['pad_ot_same', 'pad_ignore']:
-            
-
-
-
-        # to tensor
-        atom1 = torch.tensor(atom1, dtype=torch.long)
-        charge1 = torch.tensor(charge1, dtype=torch.long)
+        atom1 = torch.tensor([self.atom2idx[mol.GetAtomWithIdx(i).GetSymbol()] for i in range(n_mol_atom)], dtype=torch.long)
+        coord1 = torch.tensor(mol.GetConformer().GetPositions(), dtype=torch.float)
+        coord1 -= torch.mean(coord1, dim=0)
+        coord1 = torch.matmul(coord1, get_random_rotation_matrix(self.rng))
+        charge1 = torch.tensor([mol.GetAtomWithIdx(i).GetFormalCharge() for i in range(n_mol_atom)], dtype=torch.long)
         if (max_charge:=torch.max(charge1).item()) > MAX_ABS_CHARGE:
-            self.logger.warning(f"[{idx}] {max_charge=} > {MAX_ABS_CHARGE=}")
+            self.logger.warning(f"[{idx}] {max_charge=}")
         if (min_charge:=torch.min(charge1).item()) < -MAX_ABS_CHARGE:
-            self.logger.warning(f"[{idx}] {min_charge=} < {-MAX_ABS_CHARGE=}")
+            self.logger.warning(f"[{idx}] {min_charge=}")
         charge1.clamp_(-MAX_ABS_CHARGE, MAX_ABS_CHARGE).add_(MAX_ABS_CHARGE)
 
-        # coord to tensor
-        coord0 = torch.tensor(coord0, dtype=torch.float)
-        coord1 = torch.tensor(coord1, dtype=torch.float)
 
-
+        # OT: be careful not to disturb distribution at t=0 (especially about centerization)
+        atom_pad_idx = self.atom2idx['PAD']
+        charge_pad_idx = MAX_ABS_CHARGE
+        atom0, coord0, charge0 = self.sample0(len(atom1) if self.padding == 'ignore' else None)
+        if self.padding == 'pad_random_ot':
+            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
+            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
+            coord1 = torch.cat([coord1, self._random_coord(n_pad_atom, True)])
+            coord0 = _permute_rotate_ot(coord0, coord1)
+        elif self.padding == 'pad_ot_same':
+            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
+            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
+            coord0, pad_coord0 = torch.split(coord0, [n_mol_atom, n_pad_atom])
+            coord0 = _permute_rotate_ot(coord0, coord1)
+            coord0 = torch.cat([coord0, pad_coord0])
+            coord1 = torch.cat([coord1, pad_coord0])
+        elif self.padding == 'pad_same_ot':
+            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
+            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
+            coord1 = torch.cat([coord1, coord0[:n_pad_atom]])
+            coord0 = _permute_rotate_ot(coord0, coord1)
+        elif self.padding == 'ignore':
+            coord0 = _permute_rotate_ot(coord0, coord1)
+        else:
+            raise ValueError(f"{self.padding=}")
         return (atom0, coord0, charge0), (atom1, coord1, charge1)
 
     def __len__(self):
@@ -141,7 +171,15 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
         return idx-MAX_ABS_CHARGE
 
     def sample0(self, n_atom: int|None=None) -> Mol:
-        if n_atom is None: n_atom = self.n_atom
+        if self.padding == 'ignore':
+            if n_atom is None:
+                mol = self.mol_data[self.rng.integers(len(self.mol_data))]
+                mol = Chem.AddHs(mol)
+                n_atom = Chem.GetNumAtoms()
+        else:
+            assert n_atom is None
+            n_atom = self.n_atom
+
         # data0 node
         if self.mask_init:
             atom0 = torch.tensor([self.atom2idx['MASK']]*n_atom, dtype=torch.long)
@@ -149,10 +187,8 @@ class MolDataset(Dataset[tuple[Mol, Mol]|None]):
             atom0 = torch.tensor(self.rng.integers(0, self.n_atom_idx, size=n_atom))
 
         # data0 coord, charge
-        coord0 = self.rng.normal(size=(n_atom, 3))*self.init_coord_std
-        coord0 -= np.mean(coord0, axis=0)
+        coord0 = self._random_coord(n_atom, True)
         charge0 = torch.full((n_atom, ), MAX_ABS_CHARGE, dtype=torch.long)
-        coord0 = torch.tensor(coord0, dtype=torch.float)
         return atom0, coord0, charge0
 
 class PathSampleDataset[D, Tgt, BPred](Dataset):
@@ -173,7 +209,7 @@ class PathSampleDataset[D, Tgt, BPred](Dataset):
 
 ERROR_FORMATS = {
     'large_mol': (ValueError, re.compile(r"n_mol_atom=(\d+) > self\.n_atom=(\d+)")), 
-    'no_sn': (KeyError, re.compile(r"Sn")),
+    'no_atom': (KeyError, re.compile(r"[A-Z][a-z]?")),
 }
 class ErrorNoneDataset(Dataset):
     logger = getLogger(f"{__module__}.{__qualname__}")
@@ -198,12 +234,11 @@ class ErrorNoneDataset(Dataset):
                     self.error_count[ename] += 1
                     break
             else:
-                self.logger.info(f"Unknown error at {type(self.dataset).__name__}[{idx}]: {type(e).__name__}{e.args}")
+                raise e
             item = None
 
         self.n += 1
         if self.n in self.log_ns:
-            worker_info = get_worker_info()
             self.logger.debug(f"Error in {self.n} __getitem__:")
             for ename, ecount in sorted(self.error_count.items(), key=lambda x: -x[1]):
                 self.logger.debug(f"    {ename}: {ecount}")
@@ -229,7 +264,7 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
         data = data0.clone().detach()
         r = torch.rand_like(data, dtype=torch.float)
         is_data1 = r < k2
-        is_noise = k2 <= r < k1+k2
+        is_noise = (k2 <= r) & (r < k1+k2)
         data[is_data1] = data1[is_data1]
         data[is_noise] = torch.randint_like(data[is_noise], self.n_atom_idx)
         # target
@@ -266,7 +301,7 @@ class DenoiseCoordPath(Path[Tensor, tuple[float, Tensor], Tensor]):
     def sample(self, data0, data1, t):
         k = self.kappa(t)
         data = data0*(1-k)+data1*k
-        return (t, data), data1
+        return data, (t, data1)
     def update(self, datas, bpred, t0, t1):
         bpred = bpred.to(datas[0].device)
         k0 = self.kappa(t0)
@@ -568,15 +603,21 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
         os.makedirs(dir, exist_ok=True)
         for idx, data in zip(idxs, batch):
             (atom, coord, charge), t, (atom_tgt, coord_tgt, charge_tgt) = data
-            coord_tgt = coord_tgt[1]# coordがtによるweightを付けるため。このような処理があるのでここで実装している
-            pd.DataFrame({
-                'atom': [self.mdata.atoms[a] for a in atom.tolist()], 
-                'atom_tgt': [self.mdata.atoms[a] for a in atom_tgt.tolist()], # Discreteであることを前提としている。。
-                'charge': [self.mdata.idx2charge(c) for c in charge.tolist()],
-                'charge_tgt': [self.mdata.idx2charge(c) for c in charge_tgt.tolist()], 
-                **{f'coord_{i}': coord[:,i] for i in range(3)}, 
-                **{f'coord_tgt_{i}': coord_tgt[:,i] for i in range(3)}
-            }).to_csv(f"{dir}/{idx}.tsv", sep='\t', index=False)
+            if isinstance(coord_tgt, (tuple, list)):
+                # DenoiseCoordPathでは, coordがtによるweightを付けうるため。
+                _t, coord_tgt = coord_tgt
+            try:
+                pd.DataFrame({
+                    'atom': [self.mdata.atoms[a] for a in atom.tolist()], 
+                    'atom_tgt': [self.mdata.atoms[a] for a in atom_tgt.tolist()], # Discreteであることを前提としている。。
+                    'charge': [self.mdata.idx2charge(c) for c in charge.tolist()],
+                    'charge_tgt': [self.mdata.idx2charge(c) for c in charge_tgt.tolist()], 
+                    **{f'coord_{i}': coord[:,i] for i in range(3)}, 
+                    **{f'coord_tgt_{i}': coord_tgt[:,i] for i in range(3)}
+                }).to_csv(f"{dir}/{idx}.tsv", sep='\t', index=False)
+            except Exception as e:
+                print(f"{type(coord_tgt)=}, {coord_tgt.shape=}", flush=True)
+                raise e
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
 # Training
@@ -602,7 +643,7 @@ def get_ts(args: Namespace) -> list[float]:
 
 def get_mol_path(args: Namespace, split: str):
     dataset = UniMolLigandDataset(split, 'rdkit')
-    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init)
+    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init, padding=args.padding)
 
     coord_kappa = partial(cubic_kappa, linear=1, a=0, b=0)
     if args.coord_path == 'denoise':
@@ -625,8 +666,8 @@ def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
         backbone = EGNNMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=6, norm_coors=args.norm_coors)
         coord_head = RawCoordHead(centerize=True)
     elif args.backbone == "attn":
-        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord_emb)
-        if args.abs_coord_head:
+        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord in ['emb', 'emb_head'])
+        if args.abs_coord == 'emb_head':
             coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
         else:
             coord_head = EquivCoordHead(nn.Linear(64, 64), nn.GELU(), nn.Linear(64, 3))
@@ -646,23 +687,27 @@ def main():
     ## data
     parser.add_argument("--n-atom", type=int, default=80)
     parser.add_argument("--init-coord-std", type=float, default=3.0)
+    parser.add_argument("--padding", choices=['pad_random_ot', 'pad_ot_same', 'pad_same_ot', 'ignore'])
     ### get_ts, get_mol_path
     parser.add_argument("--t-n", type=int, default=100)
     parser.add_argument("--t-scheduler", choices=['linear', 'last_pow'], default='linear')
     ### get_mol_path
-    parser.add_argument("--atom-tgt-a", type=float, default=0.0) # k_tgt(t) = t+disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
-    parser.add_argument("--atom-tgt-b", type=float, default=0.0) # disc_0_a = disc_0_b = -1 means k0(t) = t**2
-    parser.add_argument("--atom-noise-a", type=float, default=0.0) # k_noise(t) = disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
+    # k_tgt(t) = t+disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
+    # disc_0_a = disc_0_b = -1 means k0(t) = t**2
+    # k_noise(t) = disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
+    parser.add_argument("--atom-tgt-a", type=float, default=0.0) 
+    parser.add_argument("--atom-tgt-b", type=float, default=0.0)
+    parser.add_argument("--atom-noise-a", type=float, default=0.0)
     parser.add_argument("--atom-noise-b", type=float, default=0.0)
     parser.add_argument("--mask-init", action='store_true')
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     parser.add_argument("--coord-weight-by-kappa", action='store_true') # recommended only when coord_path == 'denoise'
     ## model
     parser.add_argument("--backbone", choices=['egnn', 'attn'], default='attn')
+    ### egnn
     parser.add_argument("--norm-coors", action='store_true')
     ### attn
-    parser.add_argument("--abs-coord-emb", action='store_true')
-    parser.add_argument("--abs-coord-head", action='store_true')
+    parser.add_argument("--abs-coord", choices=['emb_head', 'emb', 'none'], required=True)
     ## training
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-step", type=int, default=10000)
@@ -682,10 +727,10 @@ def main():
         yaml.dump(vars(args), f, sort_keys=False)
 
     # data_iter
-    mdata, path = get_mol_path(args)
+    mdata, path = get_mol_path(args, 'train')
 
     # data2: PathSample
-    dataset = PathSampleDataset(dataset, path, get_ts(args))
+    dataset = PathSampleDataset(mdata, path, get_ts(args))
     dataset = ErrorNoneDataset(dataset)
     data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=args.num_workers)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
