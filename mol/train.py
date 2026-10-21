@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import Dataset, DataLoader, get_worker_info
+from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from rdkit import Chem
 from scipy.spatial.transform import Rotation as R
@@ -22,7 +22,7 @@ from egnn_pytorch import EGNN
 from src.utils.logger import get_logger, add_file_handler
 from src.utils.random import set_random_seed
 from src.fm.train import train_fm, Path, FMModel, Loss, Streamer
-from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreamer, SaveLossStreamer, SaveGradStreamer, AmpContainer, RepeatContainer, CatContainer, StepStopCriterion
+from src.fm.utils import Optimizer, Streamers, LogStepStreamer, SaveModelStreamer, SaveLossStreamer, SaveGradStreamer, LogCallStreamer, AmpContainer, RepeatContainer, CatContainer, StepStopCriterion
 from src.data.datasets.unimol import UniMolLigandDataset
 from mol.graph_attn import get_dist, AbsCoordEmbedding, GraphAttnLayer
 
@@ -54,7 +54,7 @@ def get_random_rotation_matrix(rng: np.random.Generator) -> Tensor:
     axis2 = axis2 / np.linalg.norm(axis2)
     return torch.tensor(np.array([axis0, axis1, axis2]), dtype=torch.float)
 
-def _permute_rotate_ot(coord0: Tensor, coord1: Tensor):
+def _permute_rotate_ot(coord0: Tensor, coord1: Tensor) -> Tensor:
     coord0 = coord0.numpy()
     coord1 = coord1.numpy()
     dist = np.sqrt(np.abs((coord1**2).sum(axis=1)[:, np.newaxis]+(coord0**2).sum(axis=1)[np.newaxis,:] - np.matmul(coord1, coord0.T)*2)) # [N1, N0]
@@ -64,6 +64,9 @@ def _permute_rotate_ot(coord0: Tensor, coord1: Tensor):
     coord0 = rotation.apply(coord0)
     coord0 = torch.tensor(coord0, dtype=torch.float)    
     return coord0
+
+def centerize(coord: Tensor) -> Tensor:
+    return coord - coord.mean(dim=0)
 
 def extend_tensor(x: Tensor, fill_value: int|float, n: int, dim: int=0):
     shape = list(x.shape)
@@ -127,7 +130,7 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         # data1
         atom1 = torch.tensor([self.atom2idx[mol.GetAtomWithIdx(i).GetSymbol()] for i in range(n_mol_atom)], dtype=torch.long)
         coord1 = torch.tensor(mol.GetConformer().GetPositions(), dtype=torch.float)
-        coord1 -= torch.mean(coord1, dim=0)
+        coord1 = centerize(coord1)
         coord1 = torch.matmul(coord1, get_random_rotation_matrix(self.rng))
         charge1 = torch.tensor([mol.GetAtomWithIdx(i).GetFormalCharge() for i in range(n_mol_atom)], dtype=torch.long)
         if (max_charge:=torch.max(charge1).item()) > MAX_ABS_CHARGE:
@@ -141,22 +144,22 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         atom_pad_idx = self.atom2idx['PAD']
         charge_pad_idx = MAX_ABS_CHARGE
         atom0, coord0, charge0 = self.sample0(len(atom1) if self.padding == 'ignore' else None)
-        if self.padding == 'pad_random_ot':
+        if self.padding != 'ignore':
             atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
             charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
+        if self.padding == 'pad_random_ot':
             coord1 = torch.cat([coord1, self._random_coord(n_pad_atom, True)])
             coord0 = _permute_rotate_ot(coord0, coord1)
         elif self.padding == 'pad_ot_same':
-            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
-            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
             coord0, pad_coord0 = torch.split(coord0, [n_mol_atom, n_pad_atom])
             coord0 = _permute_rotate_ot(coord0, coord1)
             coord0 = torch.cat([coord0, pad_coord0])
             coord1 = torch.cat([coord1, pad_coord0])
         elif self.padding == 'pad_same_ot':
-            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
-            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
             coord1 = torch.cat([coord1, coord0[:n_pad_atom]])
+            coord0 = _permute_rotate_ot(coord0, coord1)
+        elif self.padding == 'pad_same_center_ot':
+            coord1 = torch.cat([coord1, centerize(coord0[:n_pad_atom])])
             coord0 = _permute_rotate_ot(coord0, coord1)
         elif self.padding == 'ignore':
             coord0 = _permute_rotate_ot(coord0, coord1)
@@ -175,7 +178,7 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
             if n_atom is None:
                 mol = self.mol_data[self.rng.integers(len(self.mol_data))]
                 mol = Chem.AddHs(mol)
-                n_atom = Chem.GetNumAtoms()
+                n_atom = mol.GetNumAtoms()
         else:
             assert n_atom is None
             n_atom = self.n_atom
@@ -234,7 +237,7 @@ class ErrorNoneDataset(Dataset):
                     self.error_count[ename] += 1
                     break
             else:
-                raise e
+                self.logger.warning(f"Unknown error: {type(e)}{e.args}")
             item = None
 
         self.n += 1
@@ -755,6 +758,7 @@ def main():
         SaveGradStreamer(result_dir+"/grads/{step}/{k}.pth", CatContainer([1], AmpContainer(100, 10000))),
         SaveBatchStreamer(result_dir+"/sample_data/{step}",range(10), 3, mdata)
     ])
+    # streamer = LogCallStreamer(logger, streamer)
     stop_criterion = StepStopCriterion(args.max_step)
     train_fm(model, optimizer, data_iter, path, streamer, stop_criterion)
 
