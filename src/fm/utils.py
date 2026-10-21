@@ -1,6 +1,6 @@
 import os, random
 import itertools as itr
-from logging import Logger
+from logging import Logger, getLogger
 from collections.abc import Container, Callable, Iterator
 from typing import overload
 import torch
@@ -96,6 +96,29 @@ class LogStepStreamer(Streamer):
         self.step += 1
         if self.step in self.steps:
             self.logger.debug(f"Finished step={self.step}")
+
+class LogCallStreamer(Streamer):
+    def __init__(self, logger: Logger, streamer: Streamer):
+        self.logger = logger
+        self.streamer = streamer
+        self.step = 0
+    def start(self, model):
+        self.logger.debug(f"started streamer.start")
+        self.streamer.start(model)
+        self.logger.debug(f"ended streamer.start")
+    def put_data(self, batch):
+        self.logger.debug(f"started streamer.put_data[{self.step}]")
+        self.streamer.put_data(batch)
+        self.logger.debug(f"ended streamer.put_data[{self.step}]")
+    def put_loss(self, model, loss):
+        self.logger.debug(f"started streamer.put_loss[{self.step}]")
+        self.streamer.put_loss(model, loss)
+        self.logger.debug(f"ended streamer.put_loss[{self.step}]")
+    def put_optim(self, model, optimizer):
+        self.logger.debug(f"started streamer.put_optim[{self.step}]")
+        self.streamer.put_optim(model, optimizer)
+        self.logger.debug(f"ended streamer.put_optim[{self.step}]")
+        self.step += 1
 
 class SaveLossStreamer(Streamer):
     def __init__(self, path: str):
