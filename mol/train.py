@@ -245,7 +245,6 @@ class ErrorNoneDataset(Dataset):
             self.logger.debug(f"Error in {self.n} __getitem__:")
             for ename, ecount in sorted(self.error_count.items(), key=lambda x: -x[1]):
                 self.logger.debug(f"    {ename}: {ecount}")
-
         return item
 
 # Path
@@ -287,7 +286,7 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
             is_data1 = r < p_data1
             prob = F.softmax(bpred[idx][is_data1], dim=-1)
             data[is_data1] = torch.multinomial(prob, num_samples=1).squeeze(-1)
-            is_noise = p_data1 <= r < p_data1+p_noise
+            is_noise = (p_data1 <= r) & (r < p_data1+p_noise)
             data[is_noise] = torch.randint_like(data[is_noise], self.n_atom_idx)
         return datas
     def criterion(self, targets: list[Tensor], bpred: Tensor):
@@ -646,7 +645,7 @@ def get_ts(args: Namespace) -> list[float]:
 
 def get_mol_path(args: Namespace, split: str):
     dataset = UniMolLigandDataset(split, 'rdkit')
-    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init, padding=args.padding)
+    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init, padding=getattr(args, 'padding', 'pad_random_ot'))
 
     coord_kappa = partial(cubic_kappa, linear=1, a=0, b=0)
     if args.coord_path == 'denoise':

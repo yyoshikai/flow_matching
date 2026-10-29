@@ -34,8 +34,7 @@ if __name__ == '__main__':
 
     # mdata (encoder), path
     dataset = UniMolLigandDataset('train', 'rdkit')
-    mdata = MolDataset(dataset, n_atom, init_coord_std, mask_init=targs.mask_init)
-    path = get_mol_path(mdata, targs)
+    mdata, path = get_mol_path(targs, 'valid')
     atom_path, coord_path, charge_path = path.paths
     ts = get_ts(targs)
 
