@@ -194,6 +194,19 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         charge0 = torch.full((n_atom, ), MAX_ABS_CHARGE, dtype=torch.long)
         return atom0, coord0, charge0
 
+    def atom_init_prob(self) -> Tensor:
+        if self.mask_init:
+            prob = torch.zeros((self.n_atom_idx,), dtype=torch.float)
+            prob[self.atom2idx['MASK']] = 1.0
+        else:
+            prob = torch.full((self.n_atom_idx,), fill_value=1/self.n_atom_idx, dtype=torch.float)
+        return prob
+
+    def charge_init_prob(self) -> Tensor:
+        prob = torch.zeros((self.n_charge_idx,), dtype=torch.float)
+        prob[MAX_ABS_CHARGE] = 1.0
+        return prob
+
 class PathSampleDataset[D, Tgt, BPred](Dataset):
     def __init__(self, dataset: Dataset[tuple[D, D]], path: Path[D, Tgt, BPred], ts: list[float]):
         self.dataset = dataset
@@ -256,38 +269,35 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
     V = n_atom_idx
     
     """
-    def __init__(self, n_atom_idx: int, kappa: Callable[[float], float], noise_kappa: Callable[[float], float]):
-        self.n_atom_idx = n_atom_idx
-        self.k2 = kappa
-        self.k1 = noise_kappa
+    def __init__(self, init_prob: Tensor, kappa: Callable[[float], float], alpha: Callable[[float, float], float]|None=None):
+        self.k = kappa
+        self.alpha = alpha
+        self.init_prob = init_prob
     def sample(self, data0, data1, t):
-        k1, k2 = self.k1(t), self.k2(t)
+        k = self.k(t)
         # data
         data = data0.clone().detach()
         r = torch.rand_like(data, dtype=torch.float)
-        is_data1 = r < k2
-        is_noise = (k2 <= r) & (r < k1+k2)
+        is_data1 = r < k
         data[is_data1] = data1[is_data1]
-        data[is_noise] = torch.randint_like(data[is_noise], self.n_atom_idx)
         # target
         return data, data1
     def update(self, datas, bpred, t0, t1):
-        bpred = bpred.to(datas[0].device)
-        k1, k2 = self.k1(t0), self.k2(t0)
-        k0 = 1-k1-k2
-        assert k0 > 0
-        dk1, dk2 = self.k1(t1)-k1, self.k2(t1)-k2
-        dk0 = -(dk1+dk2)
-        k0 = max(1-k1-k2, 0)
-        p_data1 = dk2-(dk0/k0)*k2
-        p_noise = dk1-(dk0/k0)*k1
+        k0 = self.k(t0)
+        k1 = self.k(t1)
+        a = self.alpha(t0, t1)
+        assert a <= (1-k1)/(1-k0), f"Invalid alpha at {t0=}: {a=}. {(1-k1)/(1-k0)=}"
+        p_pred = (k1-k0)/(1-k0)+a*k0
+        p_backward = a*(1-k0)
         for idx, data in enumerate(datas):
-            r = torch.rand_like(data, dtype=torch.float)
-            is_data1 = r < p_data1
-            prob = F.softmax(bpred[idx][is_data1], dim=-1)
-            data[is_data1] = torch.multinomial(prob, num_samples=1).squeeze(-1)
-            is_noise = (p_data1 <= r) & (r < p_data1+p_noise)
-            data[is_noise] = torch.randint_like(data[is_noise], self.n_atom_idx)
+            r = torch.rand_like(data, dtype=torch.float, device=data.device)
+            is_pred = r < p_pred
+            if torch.any(is_pred):
+                prob = F.softmax(bpred[idx][is_pred], dim=-1)
+                data[is_pred] = torch.multinomial(prob, num_samples=1).squeeze(-1).to(data.device)
+            is_backward = (p_pred <= r) & (r < p_pred+p_backward)
+            if torch.any(is_backward):
+                data[is_backward] = torch.multinomial(self.init_prob, num_samples=is_backward.sum(), replacement=True).to(data.device)
         return datas
     def criterion(self, targets: list[Tensor], bpred: Tensor):
         B, N, V = bpred.shape
@@ -315,8 +325,8 @@ class DenoiseCoordPath(Path[Tensor, tuple[float, Tensor], Tensor]):
         btarget = torch.stack(targets).to(bpred.device)
         B, N, _ = btarget.shape
         if self.weight_by_kappa:
-            ks = torch.tensor([self.kappa[t] for t in ts]).to(bpred.device)
-            loss = torch.mean(F.mse_loss(bpred, btarget, reduction='none') * 1/(1-ks.reshape(B, 1, 1)))
+            ks = torch.tensor([self.kappa(t) for t in ts]).to(bpred.device)
+            loss = torch.mean(F.mse_loss(bpred, btarget, reduction='none') * 1/(1-ks.reshape(B, 1, 1))**2)
         else:
             loss = F.mse_loss(bpred, btarget, reduction='mean')
         return Loss([loss], ['loss'], [1.0])
@@ -643,7 +653,7 @@ def get_ts(args: Namespace) -> list[float]:
     else:
         raise ValueError(f"{args.t_scheduler=}")
 
-def get_mol_path(args: Namespace, split: str):
+def get_mol_path(args: Namespace, gargs: Namespace|None, split: str):
     dataset = UniMolLigandDataset(split, 'rdkit')
     mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init, padding=getattr(args, 'padding', 'pad_random_ot'))
 
@@ -656,11 +666,12 @@ def get_mol_path(args: Namespace, split: str):
     else:
         raise ValueError
 
-    tgt_kappa = partial(cubic_kappa, linear=1, a=args.atom_tgt_a, b=args.atom_tgt_b)
-    noise_kappa = partial(cubic_kappa, linear=0, a=args.atom_noise_a, b=args.atom_noise_b)
-    atom_path = DenoiseDiscPath(mdata.n_atom_idx, tgt_kappa, noise_kappa)
-    charge_path = DenoiseDiscPath(mdata.n_charge_idx, tgt_kappa, noise_kappa)
-
+    tgt_k = partial(cubic_kappa, linear=1, a=args.atom_tgt_a, b=args.atom_tgt_b)
+    alpha = None
+    if gargs is not None:
+        alpha = lambda t0, t1: (1-tgt_k(t1))/(1-tgt_k(t0)) * gargs.alpha_ratio
+    atom_path = DenoiseDiscPath(mdata.atom_init_prob(), tgt_k, alpha)
+    charge_path = DenoiseDiscPath(mdata.charge_init_prob(), tgt_k, alpha)
     return mdata, MolPath(atom_path, coord_path, charge_path, args.coord_loss)
 
 def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
@@ -694,13 +705,10 @@ def main():
     parser.add_argument("--t-n", type=int, default=100)
     parser.add_argument("--t-scheduler", choices=['linear', 'last_pow'], default='linear')
     ### get_mol_path
-    # k_tgt(t) = t+disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
-    # disc_0_a = disc_0_b = -1 means k0(t) = t**2
-    # k_noise(t) = disc_0_a*(max at t=1/3)+disc_0_b*(max at t=2/3)
+    # k_tgt(t) = t+atom_tgt_a*(max at t=1/3)+atom_tgt_b*(max at t=2/3)
+    # atom_tgt_a = atom_tgt_b = -1 means k0(t) = t**2
     parser.add_argument("--atom-tgt-a", type=float, default=0.0) 
     parser.add_argument("--atom-tgt-b", type=float, default=0.0)
-    parser.add_argument("--atom-noise-a", type=float, default=0.0)
-    parser.add_argument("--atom-noise-b", type=float, default=0.0)
     parser.add_argument("--mask-init", action='store_true')
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     parser.add_argument("--coord-weight-by-kappa", action='store_true') # recommended only when coord_path == 'denoise'
@@ -729,7 +737,7 @@ def main():
         yaml.dump(vars(args), f, sort_keys=False)
 
     # data_iter
-    mdata, path = get_mol_path(args, 'train')
+    mdata, path = get_mol_path(args, None, 'train')
 
     # data2: PathSample
     dataset = PathSampleDataset(mdata, path, get_ts(args))

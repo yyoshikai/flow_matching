@@ -26,6 +26,7 @@ class Loss:
     weights: list[float]
 
     def loss(self):
+        print(f"{self.losses=}, {self.weights=}", flush=True)
         return sum(loss*weight for loss, weight in zip(self.losses, self.weights))
     
     @classmethod

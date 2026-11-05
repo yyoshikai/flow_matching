@@ -16,17 +16,19 @@ if __name__ == '__main__':
     parser.add_argument("--studyname", required=True)
     parser.add_argument("--step", type=int, default=10000)
     parser.add_argument("--gname", required=True)
+    parser.add_argument("--alpha-ratio", type=float, default=0.0)
+    parser.add_argument("--n-gen", type=int, default=7)
     args = parser.parse_args()
-    n_gen = 7
     batch_size = 128
-    T = 100
 
     # environment
     gen_dir = f"mol/generates/{args.gname}/{args.studyname}/{args.step}"
     os.makedirs(f"{gen_dir}/mols", exist_ok=True)
     logger = get_logger(stream=True)
-    train_dir = f"mol/trains/{args.studyname}"
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with open(f"{gen_dir}/args.yaml", 'w') as f:
+        yaml.dump(vars(args), f, sort_keys=False)
+    train_dir = f"mol/trains/{args.studyname}"
     with open(f"{train_dir}/args.yaml") as f:
         targs = Namespace(**yaml.safe_load(f))
     n_atom = targs.n_atom
@@ -34,7 +36,7 @@ if __name__ == '__main__':
 
     # mdata (encoder), path
     dataset = UniMolLigandDataset('train', 'rdkit')
-    mdata, path = get_mol_path(targs, 'valid')
+    mdata, path = get_mol_path(targs, args, 'valid')
     atom_path, coord_path, charge_path = path.paths
     ts = get_ts(targs)
 
@@ -44,8 +46,8 @@ if __name__ == '__main__':
     model.eval()
 
     processes = [] # [B, T, P, D]
-    for i_step in range(math.ceil(n_gen/batch_size)):
-        B = min(batch_size, n_gen-i_step*batch_size)
+    for i_step in range(math.ceil(args.n_gen/batch_size)):
+        B = min(batch_size, args.n_gen-i_step*batch_size)
         datas = [mdata.sample0() for b in range(B)]
         bprocess = [deepcopy(datas)] # [T, B, P, D]
         for s in range(len(ts)-1):
@@ -59,9 +61,9 @@ if __name__ == '__main__':
 
         processes += list(zip(*bprocess)) # [B, T, P, D]
     atom, coord, charge = zip(*itr.chain(*processes)) # [P, B*T, D]
-    atoms = torch.stack(atom).reshape(B, T+1, n_atom).numpy()
-    coords = torch.stack(coord).reshape(B, T+1, n_atom, 3).numpy()
-    charges = torch.stack(charge).reshape(B, T+1, n_atom).numpy()
+    atoms = torch.stack(atom).reshape(B, len(ts), n_atom).numpy()
+    coords = torch.stack(coord).reshape(B, len(ts), n_atom, 3).numpy()
+    charges = torch.stack(charge).reshape(B, len(ts), n_atom).numpy()
     np.save(f"{gen_dir}/atom.npy", atoms)
     np.save(f"{gen_dir}/coord.npy", coords)
     np.save(f"{gen_dir}/charge.npy", charges)
