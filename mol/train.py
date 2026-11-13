@@ -473,6 +473,7 @@ class CombInvHead(nn.Sequential, GraphHead):
     def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
         x_pair = (x_pair+x_pair.transpose(-2, -3))*0.5
         return super().forward(x_pair)
+
 class IgnoreCombHead(GraphHead):
     def __init__(self, item_shape: Sequence[int]):
         super().__init__()
