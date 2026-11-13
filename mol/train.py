@@ -771,6 +771,6 @@ def main():
 
 if __name__ == '__main__':
     mp.set_start_method('fork')
-    warnings.simplefilter('error')
+    # warnings.simplefilter('error') 261105 miyabiでDataLoader workerエラーが何故か発生したので
     warnings.filterwarnings('ignore', 'numpy.core.numeric is deprecated and has been renamed to numpy._core.numeric. The numpy._core namespace contains private NumPy internals and its use is discouraged, as NumPy internals can change without warning in any release. In practice, most real-world usage of numpy.core is to access functionality in the public NumPy API. If that is the case, use the public NumPy API. If not, you are using NumPy internals. If you would still like to access an internal attribute, use numpy._core.numeric._frombuffer.', DeprecationWarning)
     main()
