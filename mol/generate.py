@@ -5,7 +5,7 @@ from copy import deepcopy
 import numpy as np
 import torch
 from rdkit import Chem
-from .train import MolDataset, get_mol_path, get_model, get_ts
+from .train import get_mol_path, get_model, get_ts
 from src.data.datasets.unimol import UniMolLigandDataset
 from src.utils.logger import get_logger
 from src.chem import atoms_coords_to_mol
@@ -41,7 +41,7 @@ if __name__ == '__main__':
     ts = get_ts(targs)
 
     # model
-    model = get_model(targs, mdata, path).to(device)
+    model = get_model(targs, mdata).to(device)
     model.load_state_dict(torch.load(f"{train_dir}/models/{args.step}.pth", map_location=device))
     model.eval()
 

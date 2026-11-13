@@ -2,7 +2,6 @@
 # Repository agent instructions
 
 ## Working method
-
 - Inspect only the files needed for the task.
 - Make the smallest coherent change and avoid unrelated refactors.
 - Apply fail-first and never-fallback behavior to all validation and runtime logic.

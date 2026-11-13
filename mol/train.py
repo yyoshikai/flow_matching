@@ -3,7 +3,7 @@ import itertools as itr
 import multiprocessing as mp
 from argparse import ArgumentParser, Namespace
 from functools import partial
-from collections.abc import Callable, Container
+from collections.abc import Callable, Container, Sequence
 from collections import defaultdict
 from logging import getLogger
 from pathlib import Path as _Path
@@ -16,6 +16,7 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from rdkit import Chem
+from rdkit.Chem.rdchem import BondType
 from scipy.spatial.transform import Rotation as R
 from scipy.optimize import linear_sum_assignment
 from egnn_pytorch import EGNN
@@ -27,11 +28,12 @@ from src.data.datasets.unimol import UniMolLigandDataset
 from mol.graph_attn import get_dist, AbsCoordEmbedding, GraphAttnLayer
 
 # Data
-Mol = tuple[Tensor, Tensor, Tensor] # atoms, coords, charges
+Mol = tuple[Tensor, Tensor, Tensor, Tensor] # atoms, coords, charges, bond
 
 with open(_Path(__file__).parent / "atoms.txt") as f:
     ATOMS = f.read().splitlines()
 MAX_ABS_CHARGE = 4
+BONDS = list(BondType.names.values())
 
 def get_random_rotation_matrix(rng: np.random.Generator) -> Tensor:
     # get axes
@@ -71,21 +73,26 @@ def centerize(coord: Tensor) -> Tensor:
 def extend_tensor(x: Tensor, fill_value: int|float, n: int, dim: int=0):
     shape = list(x.shape)
     shape[dim] = n-shape[dim]
-    return torch.cat([x, torch.full(shape, fill_value, dtype=x.dtype)], dim=dim)
+    return torch.cat([x, torch.full(shape, fill_value, dtype=x.dtype, device=x.device)], dim=dim)
 
 class MolDataset(Dataset[tuple[Mol, Mol]]):
     logger = getLogger(f"{__module__}.{__qualname__}")
-    def __init__(self, mol_data: Dataset[Chem.Mol], n_atom: int, init_coord_std: float, mask_init: bool, padding: Literal['pad_random_ot', 'pad_ot_same', 'pad_ignore', 'ignore']):
+    def __init__(self, mol_data: Dataset[Chem.Mol], n_atom: int, init_coord_std: float, 
+        init_atom: Literal['mask', 'pad', 'random'], 
+        init_bond: Literal['mask', 'pad', 'random'], 
+        padding: Literal['pad_random_ot', 'pad_ot_same', 'pad_ignore', 'ignore'],
+    ):
         """
         Parameters
         ----------
-        init_coord_std: Used for both padded atoms of data1 and all atoms of data0
-
-        mask_init: bool
-            If True, all atoms of data0 is MASK.
-            If False, all atoms are randomly initialized.
+        init_coord_std: 
+            Used for both padded atoms of data1 and all atoms of data0
+        init_atom, init_bond:
+            'mask': All token at t=0 is MASK (not PAD at t=1).
+            'pad': All token at t=0 is PAD.
+            'random': All atoms are randomly initialized (including PAD).
         padding: 
-            'pad_random_ot': Add random coord to data0 and data1 -> OT in all atoms (former default)
+            'pad_random_ot': Add random coord to data0 and data1 -> OT in all atoms (previous default)
             'pad_ot_same': OT in molecule -> same random coord to data0 and data1
             'pad_ignore': OT in molecule -> same random coord to data0 and data1, ignore at loss
             'ignore': No padding atom, ignore padded area at both model and loss.
@@ -95,19 +102,25 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         self.mol_data = mol_data
         self.n_atom = n_atom
         self.init_coord_std = init_coord_std
-        self.mask_init = mask_init
         self.padding = padding
         ## rng
         self.rng = np.random.default_rng(0)
-
         ## atom-idx map
         self.atoms = ['PAD']+ATOMS
-        if mask_init:
+        if init_atom == 'MASK':
             self.atoms.append('MASK')
         self.atom2idx = {atom: i for i, atom in enumerate(self.atoms)}
+        self.init_atom_idx = None if init_atom == 'random' \
+            else self.atom2idx[{'mask': 'MASK', 'pad': 'PAD'}[init_atom]]
         self.n_atom_idx = len(self.atoms)
-
         self.n_charge_idx = MAX_ABS_CHARGE*2+1
+        self.bonds = ['PAD', 'None']+BONDS
+        if init_bond == 'mask':
+            self.bonds.append('MASK')
+        self.bond2idx = {bond: i for i, bond in enumerate(self.bonds)}
+        self.init_bond_idx = None if init_bond == 'random' \
+            else self.bond2idx[{'mask': 'MASK', 'pad': 'PAD'}[init_bond]]
+        self.n_bond_idx = len(self.bond2idx)
 
     def _random_coord(self, n: int, centerize: bool) -> Tensor:
         x = torch.randn((n, 3), dtype=torch.float)*self.init_coord_std
@@ -138,15 +151,19 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         if (min_charge:=torch.min(charge1).item()) < -MAX_ABS_CHARGE:
             self.logger.warning(f"[{idx}] {min_charge=}")
         charge1.clamp_(-MAX_ABS_CHARGE, MAX_ABS_CHARGE).add_(MAX_ABS_CHARGE)
-
-
+        bond1 = torch.full((n_mol_atom, n_mol_atom), fill_value=self.bond2idx['None'], dtype=torch.long)
+        for idx0, idx1 in itr.combinations(range(n_mol_atom), 2):
+            b = mol.GetBondBetweenAtoms(idx0, idx1)
+            if b is not None:
+                bond1[idx0, idx1] = bond1[idx1, idx0] = self.bond2idx[b.GetBondType()]
+        
         # OT: be careful not to disturb distribution at t=0 (especially about centerization)
-        atom_pad_idx = self.atom2idx['PAD']
-        charge_pad_idx = MAX_ABS_CHARGE
-        atom0, coord0, charge0 = self.sample0(len(atom1) if self.padding == 'ignore' else None)
+        atom0, coord0, charge0, bond0 = self.sample0(len(atom1) if self.padding == 'ignore' else None)
         if self.padding != 'ignore':
-            atom1 = extend_tensor(atom1, atom_pad_idx, self.n_atom)
-            charge1 = extend_tensor(charge1, charge_pad_idx, self.n_atom)
+            atom1 = extend_tensor(atom1, self.atom2idx['PAD'], self.n_atom)
+            charge1 = extend_tensor(charge1, MAX_ABS_CHARGE, self.n_atom)
+            bond1 = extend_tensor(bond1, self.bond2idx['PAD'], self.n_atom, 0)
+            bond1 = extend_tensor(bond1, self.bond2idx['PAD'], self.n_atom, 1)
         if self.padding == 'pad_random_ot':
             coord1 = torch.cat([coord1, self._random_coord(n_pad_atom, True)])
             coord0 = _permute_rotate_ot(coord0, coord1)
@@ -165,7 +182,7 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
             coord0 = _permute_rotate_ot(coord0, coord1)
         else:
             raise ValueError(f"{self.padding=}")
-        return (atom0, coord0, charge0), (atom1, coord1, charge1)
+        return (atom0, coord0, charge0, bond0), (atom1, coord1, charge1, bond1)
 
     def __len__(self):
         return len(self.mol_data)
@@ -174,6 +191,7 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         return idx-MAX_ABS_CHARGE
 
     def sample0(self, n_atom: int|None=None) -> Mol:
+        # n_atom
         if self.padding == 'ignore':
             if n_atom is None:
                 mol = self.mol_data[self.rng.integers(len(self.mol_data))]
@@ -182,26 +200,27 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         else:
             assert n_atom is None
             n_atom = self.n_atom
-
-        # data0 node
-        if self.mask_init:
-            atom0 = torch.tensor([self.atom2idx['MASK']]*n_atom, dtype=torch.long)
-        else:
-            atom0 = torch.tensor(self.rng.integers(0, self.n_atom_idx, size=n_atom))
-
-        # data0 coord, charge
+        # atom
+        atom0 = torch.multinomial(self.atom_init_prob(), num_samples=n_atom, replacement=True)
         coord0 = self._random_coord(n_atom, True)
-        charge0 = torch.full((n_atom, ), MAX_ABS_CHARGE, dtype=torch.long)
-        return atom0, coord0, charge0
+        charge0 = torch.multinomial(self.charge_init_prob(), num_samples=n_atom, replacement=True)
+        bond0 = torch.multinomial(self.bond_init_prob(), num_samples=n_atom**2, replacement=True).reshape(n_atom, n_atom)
+        return atom0, coord0, charge0, bond0
 
     def atom_init_prob(self) -> Tensor:
-        if self.mask_init:
-            prob = torch.zeros((self.n_atom_idx,), dtype=torch.float)
-            prob[self.atom2idx['MASK']] = 1.0
-        else:
+        if self.init_atom_idx is None:
             prob = torch.full((self.n_atom_idx,), fill_value=1/self.n_atom_idx, dtype=torch.float)
+        else:
+            prob = torch.zeros((self.n_atom_idx,), dtype=torch.float)
+            prob[self.init_atom_idx] = 1.0
         return prob
-
+    def bond_init_prob(self) -> Tensor:
+        if self.init_bond_idx is None:
+            prob = torch.full((self.n_bond_idx,), fill_value=1/self.n_bond_idx, dtype=torch.float)
+        else:
+            prob = torch.zeros((self.n_bond_idx,), dtype=torch.float)
+            prob[self.init_bond_idx] = 1.0
+        return prob
     def charge_init_prob(self) -> Tensor:
         prob = torch.zeros((self.n_charge_idx,), dtype=torch.float)
         prob[MAX_ABS_CHARGE] = 1.0
@@ -299,12 +318,41 @@ class DenoiseDiscPath(Path[Tensor, Tensor, Tensor]):
             if torch.any(is_backward):
                 data[is_backward] = torch.multinomial(self.init_prob, num_samples=is_backward.sum(), replacement=True).to(data.device)
         return datas
-    def criterion(self, targets: list[Tensor], bpred: Tensor):
+    def criterion(self, targets, bpred):
         B, N, V = bpred.shape
         btarget = torch.cat(targets).to(bpred.device) # [B*N, ]
         bpred = bpred.reshape(B*N, V)
         loss = F.cross_entropy(bpred, btarget)
         return Loss([loss], ['loss'], [1.0])
+
+class SymPath(Path[Tensor, tuple[float, Tensor], Tensor]):
+    def __init__(self, raw_path: DenoiseDiscPath):
+        self.raw_path = raw_path
+    def sample(self, data0, data1, t):
+        N, _ = data0.shape
+        assert data0.shape == data1.shape == (N, N)
+        assert torch.all(data0 == data0.T) and torch.all(data1 == data1.T)
+        uind0, uind1 = torch.triu_indices(N, N, device=data0.device)
+        udata, _ = self.raw_path.sample(data0[uind0, uind1], data1[uind0, uind1], t)
+        data = torch.zeros_like(data0)
+        data[uind0, uind1] = data[uind1, uind0] = udata
+        tgt = data1[uind0, uind1]
+        return data, tgt
+    def update(self, datas, bpred, t0, t1):
+        N, _ = datas[0].shape
+        uind0, uind1 = torch.triu_indices(N, N, device=datas[0].device)
+        udatas = self.raw_path.update(
+            [data[uind0, uind1] for data in datas],
+            (bpred+bpred.T)/2, t0, t1
+        )
+        for b in range(len(datas)):
+            datas[b][uind0, uind1] = datas[b][uind1, uind0] = udatas[b]
+        return datas
+    def criterion(self, targets, bpred):
+        B, N, _, V = bpred.shape
+        uind0, uind1 = torch.triu_indices(N, N, device=bpred.device)
+        bpred = ((bpred+bpred.transpose(-2, -3))*0.5)[:, uind0, uind1, :]
+        return self.raw_path.criterion(targets, bpred)
 
 class DenoiseCoordPath(Path[Tensor, tuple[float, Tensor], Tensor]):
     def __init__(self, kappa: Callable[[float], float], weight_by_kappa: bool):
@@ -421,6 +469,19 @@ class NodeInvHead(nn.Sequential, GraphHead):
     def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
         return super().forward(x_node_inv)
 
+class CombInvHead(nn.Sequential, GraphHead):
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        x_pair = (x_pair+x_pair.transpose(-2, -3))*0.5
+        return super().forward(x_pair)
+
+class IgnoreCombHead(GraphHead):
+    def __init__(self, item_shape: Sequence[int]):
+        super().__init__()
+        self.item_shape = tuple(item_shape)
+    def forward(self, x_node_inv, x_node_equiv, x_pair, coord):
+        B, N, D = x_node_inv.shape
+        return torch.zeros((B,N,N)+self.item_shape).to(x_node_inv)
+
 class RawCoordHead(GraphHead):
     def __init__(self, centerize: bool, t_inv: bool):
         super().__init__()
@@ -448,13 +509,14 @@ class TInvCoordHead(GraphHead):
 
 ## Backbone
 class MolBackbone(nn.Module):
-    def __call__(self, atoms: Tensor, coords: Tensor, charges: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+    def __call__(self, atoms: Tensor, coords: Tensor, charges: Tensor, bonds: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
         """
         Parameters
         ----------
         atoms: [B, N]
         coords: [B, N, 3]
         charges: [B, N]
+        bonds: [B, N, N]
         ts: [B,]
 
         Returns
@@ -465,8 +527,8 @@ class MolBackbone(nn.Module):
             rotation, translation-equivariant feature
         x_pair: optional, [B, N, N, pair_size]
         """
-        return super().__call__(atoms, coords, charges, ts)
-    def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+        return super().__call__(atoms, coords, charges, bonds, ts)
+    def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, bonds: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
         raise NotImplementedError
 
 ### EGNN
@@ -481,7 +543,8 @@ class EGNNMolBackbone(MolBackbone):
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
 
-    def forward(self, atoms, coords, charges, ts):
+    def forward(self, atoms, coords, charges, bonds, ts):
+        raise NotImplementedError # 261113 not added bond information
         x_node = self.atom_emb(atoms)+self.charge_emb(charges)
         t_emb = self.t_emb(ts.unsqueeze(1)).unsqueeze(1) # [B,] -> [B,1] -> [B, 512] -> [B, 1(N), 512]
         x_node = x_node + t_emb
@@ -540,7 +603,7 @@ class AtomPairEmbedding(nn.Module):
         return pair_emb
 
 class AttnMolBackbone(MolBackbone):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, d_model: int, n_layer: int, n_head: int, abs_coord_emb: bool):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, n_bond_idx, d_model: int, n_layer: int, n_head: int, abs_coord_emb: bool):
         super().__init__()
         self.n_head = n_head
         
@@ -550,19 +613,21 @@ class AttnMolBackbone(MolBackbone):
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
         self.abs_coord_emb = AbsCoordEmbedding(d_model) if abs_coord_emb else lambda x: 0
+        self.bond_emb = nn.Embedding(n_bond_idx, n_head)
 
         # layers
         self.layers = nn.ModuleList(GraphAttnLayer(d_model, n_head) 
                 for _ in range(n_layer))
 
 
-    def forward(self, atoms, coords, charges, ts):
+    def forward(self, atoms, coords, charges, bonds, ts):
         # Embedding
         x_node = self.atom_emb(atoms) \
                 + self.charge_emb(charges) \
                 + self.abs_coord_emb(coords) \
                 + self.t_emb(ts.unsqueeze(-1)).unsqueeze(-2) # [B, Na, D]
-        x_pair = x_pair_0 = self.pair_emb(atoms, charges, coords) # [B, Na(Q), Na(K), Dh]
+        x_pair = x_pair_0 = self.pair_emb(atoms, charges, coords) \
+            +self.bond_emb(bonds) # [B, Na(Q), Na(K), Dh]
 
         # Main
         B, N, _ = x_node.shape
@@ -576,25 +641,27 @@ class AttnMolBackbone(MolBackbone):
         return x_node, None, x_pair_final-x_pair_0
 
 ## FMModel
-class MolFMModel(FMModel[Mol, tuple[Tensor, Tensor, Tensor]]):
-    def __init__(self, backbone: MolBackbone, atom_head: GraphHead, coord_head: GraphHead, charge_head: GraphHead):
+MolTgt = tuple[Tensor, tuple[float, Tensor], Tensor, Tensor]
+class MolFMModel(FMModel[Mol, MolTgt]):
+    def __init__(self, backbone: MolBackbone, atom_head: GraphHead, coord_head: GraphHead, charge_head: GraphHead, bond_head: GraphHead):
         super().__init__()
         self.backbone = backbone
-        self.heads = nn.ModuleList([atom_head, coord_head, charge_head])
+        self.heads = nn.ModuleList([atom_head, coord_head, charge_head, bond_head])
 
     def forward(self, datas, ts):
         device = self.device()
-        atoms, coords, charges = zip(*datas)
+        atoms, coords, charges, bonds = zip(*datas)
         atoms = torch.stack(atoms).to(device)
         coords = torch.stack(coords).to(device) # [B, N, 3]
         charges = torch.stack(charges).to(device)
+        bonds = torch.stack(bonds).to(device)
         ts = torch.tensor(ts, dtype=torch.float).to(device) # [B,] dtype is necessary
-        x_node_inv, x_node_equiv, x_pair = self.backbone(atoms, coords, charges, ts)
+        x_node_inv, x_node_equiv, x_pair = self.backbone(atoms, coords, charges, bonds, ts)
         return tuple(head(x_node_inv, x_node_equiv, x_pair, coords) for head in self.heads)
     def device(self) -> torch.device:
         return next(self.parameters()).device
 
-class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
+class SaveBatchStreamer(Streamer[Mol, MolTgt]):
     def __init__(self, dir_format: str, steps: Container[int], n_sample_per_step: int, mdata: MolDataset):
         self.dir_format = dir_format
         self.steps = steps
@@ -614,22 +681,25 @@ class SaveBatchStreamer(Streamer[Mol, tuple[Tensor, Tensor, Tensor]]):
         dir = self.dir_format.format(step=self.step)
         os.makedirs(dir, exist_ok=True)
         for idx, data in zip(idxs, batch):
-            (atom, coord, charge), t, (atom_tgt, coord_tgt, charge_tgt) = data
-            if isinstance(coord_tgt, (tuple, list)):
-                # DenoiseCoordPathでは, coordがtによるweightを付けうるため。
-                _t, coord_tgt = coord_tgt
-            try:
-                pd.DataFrame({
-                    'atom': [self.mdata.atoms[a] for a in atom.tolist()], 
-                    'atom_tgt': [self.mdata.atoms[a] for a in atom_tgt.tolist()], # Discreteであることを前提としている。。
-                    'charge': [self.mdata.idx2charge(c) for c in charge.tolist()],
-                    'charge_tgt': [self.mdata.idx2charge(c) for c in charge_tgt.tolist()], 
-                    **{f'coord_{i}': coord[:,i] for i in range(3)}, 
-                    **{f'coord_tgt_{i}': coord_tgt[:,i] for i in range(3)}
-                }).to_csv(f"{dir}/{idx}.tsv", sep='\t', index=False)
-            except Exception as e:
-                print(f"{type(coord_tgt)=}, {coord_tgt.shape=}", flush=True)
-                raise e
+            (atom, coord, charge, bond), t, (atom_tgt, (_t, coord_tgt), charge_tgt, bond_tgt) = data
+            N, = atom.shape
+            os.makedirs(f"{dir}/{idx}", exist_ok=True)
+
+            pd.DataFrame({
+                'atom': [self.mdata.atoms[a] for a in atom.tolist()], 
+                'atom_tgt': [self.mdata.atoms[a] for a in atom_tgt.tolist()], # Discreteであることを前提としている。。
+                'charge': [self.mdata.idx2charge(c) for c in charge.tolist()],
+                'charge_tgt': [self.mdata.idx2charge(c) for c in charge_tgt.tolist()], 
+                **{f'coord_{i}': coord[:,i] for i in range(3)}, 
+                **{f'coord_tgt_{i}': coord_tgt[:,i] for i in range(3)}
+            }).to_string(f"{dir}/{idx}/nodes.txt", index=False)
+            bond_tgt_m = torch.zeros_like(bond)
+            uind0, uind1 = torch.triu_indices(N, N, device=bond.device)
+            bond_tgt_m[uind0, uind1] = bond_tgt_m[uind1, uind0] = bond_tgt
+            pd.DataFrame({
+                **{(i, 'data'): bond[i] for i in range(N)},
+                **{(i, 'tgt'): bond_tgt_m[i] for i in range(N)},
+            }).T.sort_index().to_string(f"{dir}/{idx}/bond.txt")
         pd.DataFrame({'idx': idxs, 't': ts}).to_csv(f"{dir}/t.tsv", sep='\t', index=False)
 
 # Training
@@ -655,11 +725,11 @@ def get_ts(args: Namespace) -> list[float]:
 
 def get_mol_path(args: Namespace, gargs: Namespace|None, split: str):
     dataset = UniMolLigandDataset(split, 'rdkit')
-    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, mask_init=args.mask_init, padding=getattr(args, 'padding', 'pad_random_ot'))
+    mdata = MolDataset(dataset, args.n_atom, args.init_coord_std, args.init_atom, args.init_bond, padding=args.padding)
 
     coord_kappa = partial(cubic_kappa, linear=1, a=0, b=0)
     if args.coord_path == 'denoise':
-        coord_path = DenoiseCoordPath(coord_kappa, getattr(args, 'coord_weight_by_kappa', False))
+        coord_path = DenoiseCoordPath(coord_kappa, args.coord_weight_by_kappa)
     elif args.coord_path == 'vector':
         assert args.t_scheduler == 'linear'
         coord_path = VectorCoordPath(coord_kappa, 1/args.t_n)
@@ -672,14 +742,16 @@ def get_mol_path(args: Namespace, gargs: Namespace|None, split: str):
         alpha = lambda t0, t1: (1-tgt_k(t1))/(1-tgt_k(t0)) * gargs.alpha_ratio
     atom_path = DenoiseDiscPath(mdata.atom_init_prob(), tgt_k, alpha)
     charge_path = DenoiseDiscPath(mdata.charge_init_prob(), tgt_k, alpha)
-    return mdata, MolPath(atom_path, coord_path, charge_path, args.coord_loss)
+    bond_path = SymPath(DenoiseDiscPath(mdata.bond_init_prob(), tgt_k, alpha))
+    return mdata, TuplePath([atom_path, coord_path, charge_path, bond_path],
+            ["atom", "coord", "charge", "bond"], [1, args.coord_loss, 1, args.bond_loss])
 
-def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
+def get_model(args: Namespace, mdata: MolDataset) -> MolFMModel:
     if args.backbone == "egnn":
         backbone = EGNNMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=6, norm_coors=args.norm_coors)
         coord_head = RawCoordHead(centerize=True)
     elif args.backbone == "attn":
-        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord in ['emb', 'emb_head'])
+        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, mdata.n_bond_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord in ['emb', 'emb_head'])
         if args.abs_coord == 'emb_head':
             coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
         else:
@@ -690,7 +762,11 @@ def get_model(args: Namespace, mdata: MolDataset, path: MolPath) -> MolFMModel:
         coord_head = TInvCoordHead(coord_head)
     atom_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_atom_idx))
     charge_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_charge_idx))
-    return MolFMModel(backbone, atom_head, coord_head, charge_head)
+    if args.generate_bond:
+        bond_head = CombInvHead(nn.Linear(64, 512), nn.GELU(), nn.Linear(512, mdata.n_bond_idx))
+    else:
+        bond_head = IgnoreCombHead((mdata.n_bond_idx,))
+    return MolFMModel(backbone, atom_head, coord_head, charge_head, bond_head)
 
 def main():
     # parameters
@@ -709,7 +785,8 @@ def main():
     # atom_tgt_a = atom_tgt_b = -1 means k0(t) = t**2
     parser.add_argument("--atom-tgt-a", type=float, default=0.0) 
     parser.add_argument("--atom-tgt-b", type=float, default=0.0)
-    parser.add_argument("--mask-init", action='store_true')
+    parser.add_argument("--init-atom", choices=['mask', 'pad', 'random'])
+    parser.add_argument("--init-bond", choices=['mask', 'pad', 'random'])
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     parser.add_argument("--coord-weight-by-kappa", action='store_true') # recommended only when coord_path == 'denoise'
     ## model
@@ -723,6 +800,8 @@ def main():
     parser.add_argument("--max-step", type=int, default=10000)
     parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-4
     parser.add_argument("--coord-loss", type=float, default=0.3)
+    parser.add_argument("--bond-loss", type=float, default=0.0)
+    parser.add_argument("--generate-bond", action='store_true')
     args = parser.parse_args()
 
     # training
@@ -748,7 +827,7 @@ def main():
     data_iter = itr.batched(data_iter, args.batch_size)
 
     # model
-    model = get_model(args, mdata, path).to(device)
+    model = get_model(args, mdata).to(device)
 
     optim = torch.optim.Adam(model.parameters(), lr=args.item_lr*args.batch_size)
     optimizer = Optimizer(
@@ -768,6 +847,46 @@ def main():
     # streamer = LogCallStreamer(logger, streamer)
     stop_criterion = StepStopCriterion(args.max_step)
     train_fm(model, optimizer, data_iter, path, streamer, stop_criterion)
+
+def update_old_args(args: dict):
+    # 261020 padding, coord_weight_by_kappa
+    args.setdefault('padding', 'pad_random_ot')
+    args.setdefault('coord_weight_by_kappa', False)
+    # 261023 all
+    args.setdefault('coord_loss', 0.3)
+    if 'atom_tgt_a' not in args:
+        disc_scheduler = args.pop('disc_scheduler', 'sq')
+        if disc_scheduler == 'linear':
+            args['atom_tgt_a'] = args['atom_tgt_b'] = 0.0
+        elif disc_scheduler == 'sq':
+            args['atom_tgt_a'] = args['atom_tgt_b'] = -1.0
+        else:
+            raise ValueError
+        # args['atom_noise_a'] = args['atom_noise_b'] = 0.0 261031
+    if 'abs_coord' not in args and 'abs_coord_head' in args: 
+        # abs_coord_head もない昔のバージョンは不明
+        args['abs_coord'] = {
+            (True, True): 'emb_head',
+            (False, True): 'emb',
+            (False, False): 'none'
+        }[args.pop('abs_coord_head'), args.pop('abs_coord_emb')]
+
+    if 'padding' not in args:
+        args['padding'] = 'pad_random_ot'
+    # 261031 remove noise_kappa, add backward sampling
+    if 'atom_noise_a' in args:
+        if args['atom_noise_a'] != 0 or args['atom_noise_b'] != 0:
+            raise ValueError("atom_noise is not zero.")
+        del args['atom_noise_a'], args['atom_noise_b']
+    # 261111 mask_init -> init_atom, init_bond, add bond
+    if 'init_atom' not in args:
+        args['init_atom'] = {
+            False: 'random',
+            True: 'mask'
+        }[args['mask_init']]
+        args['init_bond'] = 'random'
+    args.setdefault('bond_loss', 0.0)
+    args.setdefault('generate_bond', False)
 
 if __name__ == '__main__':
     mp.set_start_method('fork')
