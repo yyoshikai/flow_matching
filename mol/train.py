@@ -785,8 +785,8 @@ def main():
     # atom_tgt_a = atom_tgt_b = -1 means k0(t) = t**2
     parser.add_argument("--atom-tgt-a", type=float, default=0.0) 
     parser.add_argument("--atom-tgt-b", type=float, default=0.0)
-    parser.add_argument("--init-atom", choices=['mask', 'pad', 'random'])
-    parser.add_argument("--init-bond", choices=['mask', 'pad', 'random'])
+    parser.add_argument("--init-atom", choices=['mask', 'pad', 'random'], default='random')
+    parser.add_argument("--init-bond", choices=['mask', 'pad', 'random'], default='random')
     parser.add_argument("--coord-path", choices=['denoise', 'vector'], default='denoise')
     parser.add_argument("--coord-weight-by-kappa", action='store_true') # recommended only when coord_path == 'denoise'
     ## model
