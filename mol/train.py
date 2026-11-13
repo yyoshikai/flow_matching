@@ -528,7 +528,7 @@ class MolBackbone(nn.Module):
         x_pair: optional, [B, N, N, pair_size]
         """
         return super().__call__(atoms, coords, charges, bonds, ts)
-    def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, bonds: Tensor, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
+    def forward(self, atoms: Tensor, coords: Tensor, charges: Tensor, bonds: Tensor|None, ts: Tensor) -> tuple[Tensor, Tensor|None, Tensor|None]:
         raise NotImplementedError
 
 ### EGNN
@@ -603,22 +603,21 @@ class AtomPairEmbedding(nn.Module):
         return pair_emb
 
 class AttnMolBackbone(MolBackbone):
-    def __init__(self, n_atom_idx: int, n_charge_idx: int, n_bond_idx, d_model: int, n_layer: int, n_head: int, abs_coord_emb: bool):
+    def __init__(self, n_atom_idx: int, n_charge_idx: int, n_bond_idx, d_model: int, n_layer: int, n_head: int, abs_coord_emb: bool, input_bond: bool):
         super().__init__()
         self.n_head = n_head
-        
+        self.input_bond = input_bond
         # embedding        
         self.atom_emb = nn.Embedding(n_atom_idx, d_model)
         self.pair_emb = AtomPairEmbedding(n_head, n_atom_idx, n_charge_idx)
         self.charge_emb = nn.Embedding(n_charge_idx, d_model)
         self.t_emb = nn.Linear(1, d_model)
         self.abs_coord_emb = AbsCoordEmbedding(d_model) if abs_coord_emb else lambda x: 0
-        self.bond_emb = nn.Embedding(n_bond_idx, n_head)
-
+        if self.input_bond:
+            self.bond_emb = nn.Embedding(n_bond_idx, n_head)
         # layers
         self.layers = nn.ModuleList(GraphAttnLayer(d_model, n_head) 
                 for _ in range(n_layer))
-
 
     def forward(self, atoms, coords, charges, bonds, ts):
         # Embedding
@@ -626,8 +625,9 @@ class AttnMolBackbone(MolBackbone):
                 + self.charge_emb(charges) \
                 + self.abs_coord_emb(coords) \
                 + self.t_emb(ts.unsqueeze(-1)).unsqueeze(-2) # [B, Na, D]
-        x_pair = x_pair_0 = self.pair_emb(atoms, charges, coords) \
-            +self.bond_emb(bonds) # [B, Na(Q), Na(K), Dh]
+        x_pair = x_pair_0 = self.pair_emb(atoms, charges, coords) # [B, Na(Q), Na(K), Dh]
+        if self.input_bond:
+            x_pair = x_pair+self.bond_emb(bonds)
 
         # Main
         B, N, _ = x_node.shape
@@ -640,21 +640,23 @@ class AttnMolBackbone(MolBackbone):
 
         return x_node, None, x_pair_final-x_pair_0
 
-## FMModel
+## FMModel Bond の有無でクラスを分けてもよいかもしれない
 MolTgt = tuple[Tensor, tuple[float, Tensor], Tensor, Tensor]
 class MolFMModel(FMModel[Mol, MolTgt]):
-    def __init__(self, backbone: MolBackbone, atom_head: GraphHead, coord_head: GraphHead, charge_head: GraphHead, bond_head: GraphHead):
+    def __init__(self, backbone: MolBackbone, atom_head: GraphHead, coord_head: GraphHead, charge_head: GraphHead, bond_head: GraphHead|None):
         super().__init__()
         self.backbone = backbone
-        self.heads = nn.ModuleList([atom_head, coord_head, charge_head, bond_head])
-
+        self.bond = bond_head is not None
+        self.heads = nn.ModuleList([atom_head, coord_head, charge_head])
+        if self.bond:
+            self.heads.append(bond_head)
     def forward(self, datas, ts):
         device = self.device()
         atoms, coords, charges, bonds = zip(*datas)
         atoms = torch.stack(atoms).to(device)
         coords = torch.stack(coords).to(device) # [B, N, 3]
         charges = torch.stack(charges).to(device)
-        bonds = torch.stack(bonds).to(device)
+        bonds = torch.stack(bonds).to(device) if self.bond else None
         ts = torch.tensor(ts, dtype=torch.float).to(device) # [B,] dtype is necessary
         x_node_inv, x_node_equiv, x_pair = self.backbone(atoms, coords, charges, bonds, ts)
         return tuple(head(x_node_inv, x_node_equiv, x_pair, coords) for head in self.heads)
@@ -751,7 +753,7 @@ def get_model(args: Namespace, mdata: MolDataset) -> MolFMModel:
         backbone = EGNNMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, d_model=512, n_layer=6, norm_coors=args.norm_coors)
         coord_head = RawCoordHead(centerize=True)
     elif args.backbone == "attn":
-        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, mdata.n_bond_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord in ['emb', 'emb_head'])
+        backbone = AttnMolBackbone(mdata.n_atom_idx, mdata.n_charge_idx, mdata.n_bond_idx, d_model=512, n_layer=8, n_head=64, abs_coord_emb=args.abs_coord in ['emb', 'emb_head'], input_bond=args.generate_bond)
         if args.abs_coord == 'emb_head':
             coord_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 3))
         else:
@@ -762,10 +764,8 @@ def get_model(args: Namespace, mdata: MolDataset) -> MolFMModel:
         coord_head = TInvCoordHead(coord_head)
     atom_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_atom_idx))
     charge_head = NodeInvHead(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, mdata.n_charge_idx))
-    if args.generate_bond:
-        bond_head = CombInvHead(nn.Linear(64, 512), nn.GELU(), nn.Linear(512, mdata.n_bond_idx))
-    else:
-        bond_head = IgnoreCombHead((mdata.n_bond_idx,))
+    bond_head = CombInvHead(nn.Linear(64, 512), nn.GELU(), nn.Linear(512, mdata.n_bond_idx)) \
+        if args.generate_bond else None
     return MolFMModel(backbone, atom_head, coord_head, charge_head, bond_head)
 
 def main():
