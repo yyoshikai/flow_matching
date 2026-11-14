@@ -802,7 +802,7 @@ def main():
     ### attn
     parser.add_argument("--abs-coord", choices=['emb_head', 'emb', 'none'], default='emb_head')
     ## training
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--max-step", type=int, default=10000)
     parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-4
     parser.add_argument("--coord-loss", type=float, default=1.0)
