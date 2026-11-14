@@ -204,7 +204,9 @@ class MolDataset(Dataset[tuple[Mol, Mol]]):
         atom0 = torch.multinomial(self.atom_init_prob(), num_samples=n_atom, replacement=True)
         coord0 = self._random_coord(n_atom, True)
         charge0 = torch.multinomial(self.charge_init_prob(), num_samples=n_atom, replacement=True)
-        bond0 = torch.multinomial(self.bond_init_prob(), num_samples=n_atom**2, replacement=True).reshape(n_atom, n_atom)
+        bond0 = torch.zeros((n_atom, n_atom), dtype=torch.long)
+        uind0, uind1 = torch.triu_indices(n_atom, n_atom)
+        bond0[uind0, uind1] = bond0[uind1, uind0] = torch.multinomial(self.bond_init_prob(), num_samples=len(uind0), replacement=True)
         return atom0, coord0, charge0, bond0
 
     def atom_init_prob(self) -> Tensor:
@@ -249,8 +251,9 @@ ERROR_FORMATS = {
 class ErrorNoneDataset(Dataset):
     logger = getLogger(f"{__module__}.{__qualname__}")
 
-    def __init__(self, dataset: Dataset):
+    def __init__(self, dataset: Dataset, raise_unknown: bool):
         self.dataset = dataset
+        self.raise_unknown = raise_unknown
         self.error_count = defaultdict(int)
         self.n = 0
         self.log_ns = AmpContainer(1000)
@@ -269,6 +272,8 @@ class ErrorNoneDataset(Dataset):
                     self.error_count[ename] += 1
                     break
             else:
+                if self.raise_unknown:
+                    raise e
                 self.logger.warning(f"Unknown error: {type(e)}{e.args}")
             item = None
 
@@ -331,7 +336,8 @@ class SymPath(Path[Tensor, tuple[float, Tensor], Tensor]):
     def sample(self, data0, data1, t):
         N, _ = data0.shape
         assert data0.shape == data1.shape == (N, N)
-        assert torch.all(data0 == data0.T) and torch.all(data1 == data1.T)
+        assert torch.all(data0 == data0.T)
+        assert torch.all(data1 == data1.T)
         uind0, uind1 = torch.triu_indices(N, N, device=data0.device)
         udata, _ = self.raw_path.sample(data0[uind0, uind1], data1[uind0, uind1], t)
         data = torch.zeros_like(data0)
@@ -776,7 +782,7 @@ def main():
     ## data
     parser.add_argument("--n-atom", type=int, default=80)
     parser.add_argument("--init-coord-std", type=float, default=3.0)
-    parser.add_argument("--padding", choices=['pad_random_ot', 'pad_ot_same', 'pad_same_ot', 'ignore'])
+    parser.add_argument("--padding", choices=['pad_random_ot', 'pad_ot_same', 'pad_same_ot', 'ignore'], default='pad_same_ot')
     ### get_ts, get_mol_path
     parser.add_argument("--t-n", type=int, default=100)
     parser.add_argument("--t-scheduler", choices=['linear', 'last_pow'], default='linear')
@@ -794,14 +800,16 @@ def main():
     ### egnn
     parser.add_argument("--norm-coors", action='store_true')
     ### attn
-    parser.add_argument("--abs-coord", choices=['emb_head', 'emb', 'none'], required=True)
+    parser.add_argument("--abs-coord", choices=['emb_head', 'emb', 'none'], default='emb_head')
     ## training
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-step", type=int, default=10000)
     parser.add_argument("--item-lr", type=float, default=3e-4/512) # original: batch_size=512, max_lr=3e-4
-    parser.add_argument("--coord-loss", type=float, default=0.3)
+    parser.add_argument("--coord-loss", type=float, default=1.0)
     parser.add_argument("--bond-loss", type=float, default=0.0)
     parser.add_argument("--generate-bond", action='store_true')
+    ## debug
+    parser.add_argument("--raise-unknown-error", action='store_true')
     args = parser.parse_args()
 
     # training
@@ -820,7 +828,7 @@ def main():
 
     # data2: PathSample
     dataset = PathSampleDataset(mdata, path, get_ts(args))
-    dataset = ErrorNoneDataset(dataset)
+    dataset = ErrorNoneDataset(dataset, args.raise_unknown_error)
     data_loader = DataLoader(dataset, batch_size=None, shuffle=True, num_workers=args.num_workers)
     data_iter = itr.chain.from_iterable(itr.repeat(data_loader))
     data_iter = itr.filterfalse(lambda x: x is None, data_iter)
